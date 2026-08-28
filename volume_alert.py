@@ -16,7 +16,7 @@ import requests
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]   # 想监控的合约品种，可自行增删
 INTERVAL = "5m"                     # K线周期：1m, 5m, 15m, 1h ...
 LOOKBACK = 20                       # 用前面多少根K线计算平均成交量
-THRESHOLD_MULTIPLIER = 3.0          # 放大倍数阈值，超过这个倍数才报警
+THRESHOLD_MULTIPLIER = 1.1         # 放大倍数阈值，超过这个倍数才报警
 # =======================================
 
 BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
