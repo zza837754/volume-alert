@@ -1,0 +1,27 @@
+name: Binance Volume Monitor
+
+on:
+  schedule:
+    # 每5分钟触发一次（GitHub 实际执行可能有几分钟延迟，属于正常现象）
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # 允许你在网页上手动点一下立即运行，方便测试
+
+jobs:
+  check-volume:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 运行监控脚本
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python volume_alert.py
