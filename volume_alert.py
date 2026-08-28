@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-币安永续合约 - 成交量异常放大监控脚本
+OKX 永续合约 - 成交量异常放大监控脚本
 逻辑：取最近一根已收盘的 5分钟K线成交量，与前面 N 根K线的平均成交量对比，
 如果放大倍数超过阈值，就通过 PushPlus 推送微信通知。
+
+数据源用 OKX 而不是币安：因为币安合约接口(fapi.binance.com)对美国地区IP
+直接返回451拒绝访问，而 GitHub Actions 的服务器全部在美国机房，无法绕过。
+OKX 的公开行情接口没有这个限制。
 
 运行方式：由 GitHub Actions 定时触发（见 .github/workflows/volume_monitor.yml）
 也可以在自己电脑上手动跑：python volume_alert.py
@@ -13,36 +17,45 @@ import sys
 import requests
 
 # ========== 可自行修改的配置 ==========
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]   # 想监控的合约品种，可自行增删
-INTERVAL = "5m"                     # K线周期：1m, 5m, 15m, 1h ...
+# OKX 永续合约命名格式：币种-USDT-SWAP
+SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]   # 想监控的合约品种，可自行增删
+INTERVAL = "5m"                     # K线周期：1m, 5m, 15m, 1H ...
 LOOKBACK = 20                       # 用前面多少根K线计算平均成交量
 THRESHOLD_MULTIPLIER = 1.1         # 放大倍数阈值，超过这个倍数才报警
 # =======================================
 
-BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+OKX_KLINES_URL = "https://www.okx.com/api/v5/market/candles"
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 
 
 def get_klines(symbol: str, interval: str, limit: int):
-    """从币安合约公开接口获取K线数据，不需要API Key"""
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=10)
+    """从OKX合约公开接口获取K线数据，不需要API Key"""
+    params = {"instId": symbol, "bar": interval, "limit": limit}
+    resp = requests.get(OKX_KLINES_URL, params=params, timeout=10)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if data.get("code") != "0":
+        raise RuntimeError(f"OKX接口返回错误: {data}")
+    # OKX 返回的K线是从新到旧排列，反转成从旧到新，跟原逻辑保持一致
+    return list(reversed(data["data"]))
 
 
 def check_symbol(symbol: str):
     """
     检查单个品种是否出现放量。
-    返回 (是否触发, 详情文本) 
+    返回 (是否触发, 详情文本)
     """
-    # 多取1根，因为最后一根可能还没收盘，我们只用倒数第2根(已收盘)当"当前"K线
+    # OKX K线字段：[ts, o, h, l, c, vol(张数), volCcy(币本位), volCcyQuote(USDT计价), confirm]
+    # confirm="1" 表示这根K线已收盘，"0" 表示还在进行中
     klines = get_klines(symbol, INTERVAL, LOOKBACK + 2)
     if len(klines) < LOOKBACK + 2:
         return False, f"{symbol}: 数据不足，跳过"
 
-    # 币安K线字段：[开盘时间, 开, 高, 低, 收, 成交量(币本位), 收盘时间, 成交额(USDT), ...]
-    closed_klines = klines[:-1]          # 去掉最后一根未收盘的
+    # 只保留已收盘的K线
+    closed_klines = [k for k in klines if k[8] == "1"]
+    if len(closed_klines) < LOOKBACK + 1:
+        return False, f"{symbol}: 已收盘K线数据不足，跳过"
+
     current = closed_klines[-1]          # 最新已收盘的一根
     history = closed_klines[-(LOOKBACK + 1):-1]  # 再往前 LOOKBACK 根作为基准
 
