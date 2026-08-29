@@ -25,4 +25,4 @@ jobs:
 
       - name: 运行监控脚本
         env:
-          DINGTALK_WEBHOOK: ${{
+DINGTALK_WEBHOOK:{{ secrets.DINGTALK_WEBHOOK }}
