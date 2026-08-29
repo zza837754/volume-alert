@@ -22,5 +22,5 @@ jobs:
 
       - name: 运行监控脚本
         env:
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
         run: python volume_alert.py
