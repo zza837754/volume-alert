@@ -41,4 +41,3 @@ jobs:
           git diff --cached --quiet || git commit -m "更新检查记录"
           git pull --rebase origin main
           git push
-
