@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]   # 想监控的合约品种，可自行增删
 INTERVAL = "3m"                     # K线周期：1m, 3m, 5m, 15m, 1H ...（跟你看盘的3分钟图保持一致）
 LOOKBACK = 20                       # 用前面多少根K线计算平均成交量
-THRESHOLD_MULTIPLIER = 0.2          # 放大倍数阈值：8倍，只抓明显突出的大量柱，不是普通的温和放量
+THRESHOLD_MULTIPLIER = 3          # 放大倍数阈值：8倍，只抓明显突出的大量柱，不是普通的温和放量
 
 NEWS_ENABLED = True                 # 是否开启币圈大事新闻推送
 NEWS_STATE_FILE = "seen_news_ids.txt"  # 记录已推送过的新闻链接，避免重复推送
