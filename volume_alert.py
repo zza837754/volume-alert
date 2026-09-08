@@ -31,8 +31,8 @@ INTERVAL = "5m"                     # K线周期：1m, 3m, 5m, 15m, 1H ...
 # 绝对数量阈值：每根K线的成交量(按币的数量，不是USDT金额)达到这个数就推送
 # 不同币价格差异大，所以每个品种分开设置
 VOLUME_THRESHOLDS = {
-    "BTC-USDT-SWAP": 5500,      # 5分钟内成交达到 5500 个 BTC 才推送
-    "ETH-USDT-SWAP": 100000,    # 5分钟内成交达到 100000 个 ETH 才推送
+    "BTC-USDT-SWAP": 2500,      # 5分钟内成交达到 5500 个 BTC 才推送
+    "ETH-USDT-SWAP": 70000,    # 5分钟内成交达到 100000 个 ETH 才推送
 }
 
 NEWS_ENABLED = True                 # 是否开启币圈大事新闻推送
