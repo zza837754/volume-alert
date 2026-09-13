@@ -1,21 +1,23 @@
 name: Binance Volume Monitor
 
 on:
-  schedule:
-    # 每5分钟触发一次（GitHub 实际执行可能有几分钟延迟，属于正常现象）
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # 允许你在网页上手动点一下立即运行，方便测试
+  # 已经改用 cron-job.org 每5分钟从外部主动触发(workflow_dispatch)，
+  # 不再需要 GitHub 自己的 schedule 定时器，两个同时开会导致触发频率翻倍、
+  # 任务排队积压，所以这里把 schedule 去掉，只保留 workflow_dispatch。
+  workflow_dispatch: {}
 
 permissions:
-  contents: write   # 需要写权限，才能把"已推送新闻记录"提交回仓库，避免重复推送
+  contents: write   # 需要写权限，才能把"检查记录"提交回仓库，避免重复推送
 
 concurrency:
   group: volume-monitor
-  cancel-in-progress: false   # 同一时间只允许一次运行，排队执行，避免互相抢着推送产生冲突
+  cancel-in-progress: true   # 如果上一次还没跑完，新的触发直接顶替旧的排队任务，
+                              # 而不是无限堆积在队列里(之前 false 导致积压卡死)
 
 jobs:
   check-volume:
     runs-on: ubuntu-latest
+    timeout-minutes: 5        # 防止某次运行卡住不退出，占着队列不放
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
