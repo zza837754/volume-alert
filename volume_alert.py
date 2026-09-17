@@ -18,6 +18,8 @@ OKX 的公开行情接口没有这个限制。
 
 import os
 import sys
+import re
+import html
 import datetime
 import email.utils
 import requests
@@ -32,7 +34,7 @@ INTERVAL = "5m"                     # K线周期：1m, 3m, 5m, 15m, 1H ...
 # 不同币价格差异大，所以每个品种分开设置
 VOLUME_THRESHOLDS = {
     "BTC-USDT-SWAP": 5500,      # 5分钟内成交达到 5500 个 BTC 才推送
-    "ETH-USDT-SWAP": 130000,    # 5分钟内成交达到 130000 个 ETH 才推送
+    "ETH-USDT-SWAP": 100000,    # 5分钟内成交达到 100000 个 ETH 才推送
 }
 
 NEWS_ENABLED = True                 # 是否开启币圈大事新闻推送
@@ -194,6 +196,35 @@ def save_seen_news_ids(ids):
         f.write("\n".join(ids))
 
 
+def fetch_article_summary(url: str, max_len: int = 150):
+    """
+    打开新闻链接，抓取网页自带的摘要信息（og:description 或 meta description，
+    绝大多数正规新闻网站都会放这个，用来做搜索引擎/社交媒体预览），
+    这样推送里除了标题还能看到一段内容概要。抓取失败就返回 None，不影响整体推送。
+    """
+    try:
+        resp = requests.get(
+            url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True
+        )
+        page_html = resp.text[:200000]  # 只看前面一部分，够找到meta标签了，避免大页面拖慢速度
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page_html, re.IGNORECASE)
+            if match:
+                summary = html.unescape(match.group(1)).strip()
+                if summary:
+                    return summary[:max_len] + ("…" if len(summary) > max_len else "")
+    except Exception as e:
+        print(f"抓取摘要失败 {url}: {e}", file=sys.stderr)
+    return None
+
+
 def fetch_rss_items(feed_url: str):
     """
     拉取并解析一个RSS订阅源，返回 [(标题, 链接, 发布时间datetime或None), ...] 列表。
@@ -279,7 +310,11 @@ def check_news():
         print("没有新的新闻。")
     else:
         for title, link in new_items[:NEWS_MAX_PUSH_PER_RUN]:
-            content = f"{title}\n{link}"
+            summary = fetch_article_summary(link)
+            if summary:
+                content = f"{title}\n\n📝 {summary}\n\n{link}"
+            else:
+                content = f"{title}\n{link}"
             push_to_dingtalk("🌐 币圈大事提醒", content)
         print(f"本次推送了 {min(len(new_items), NEWS_MAX_PUSH_PER_RUN)} 条新新闻。")
 
