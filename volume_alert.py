@@ -39,13 +39,29 @@ VOLUME_THRESHOLDS = {
 
 NEWS_ENABLED = True                 # 是否开启币圈大事新闻推送
 NEWS_STATE_FILE = "seen_news_ids.txt"  # 记录已推送过的新闻链接，避免重复推送
-NEWS_MAX_PUSH_PER_RUN = 5           # 单次最多推送几条新闻，防止刷屏
+NEWS_MAX_PUSH_PER_RUN = 3           # 单次最多推送几条新闻，防止刷屏
 NEWS_MAX_AGE_HOURS = 3              # 新鲜度过滤：新闻实际发布时间超过这个小时数就丢弃，不管是不是"没见过"
-# 新闻来源：谷歌新闻的中文加密货币聚合订阅（谷歌服务很稳定，不需要注册/token，
-# 本身就是从各大中文财经媒体汇总加密货币相关报道，缺点是国内需要翻墙才能打开）
-# 加上 when:1d 限定谷歌只搜最近1天内的，减少旧新闻混进来的概率
+# 新闻来源：金色财经"精选"快讯，通过 RSSHub(开源RSS网关，不需要注册/token)转换。
+# 换成这个而不是谷歌新闻，是因为谷歌新闻返回的链接是"加密跳转链接"，不是原文
+# 直接地址，导致后面抓取摘要那一步拿到的是谷歌中转页而不是原文内容，摘要抓不到。
+# 金色财经的链接是直接指向原文的真实地址，抓摘要才能正常生效。
 NEWS_RSS_FEEDS = [
-    "https://news.google.com/rss/search?q=%E5%8A%A0%E5%AF%86%E8%B4%A7%E5%B8%81+OR+%E6%AF%94%E7%89%B9%E5%B8%81+OR+%E5%8A%A0%E5%AF%86%E5%B8%82%E5%9C%BA+when:1d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+    "https://rsshub.app/jinse/lives/1",
+]
+
+# 关键词筛选：标题里必须命中下面任意一个词，才认为是"大事"，才会推送。
+# 命中不到任何词的普通日常快讯直接过滤掉，不推送。可以自己增删这个列表。
+NEWS_KEYWORDS_MUST_HAVE = [
+    # 监管/政策/宏观
+    "SEC", "美联储", "加息", "降息", "监管", "立法", "合规", "制裁", "白宫", "特朗普",
+    "政府", "央行", "关税", "法案", "起诉", "罚款", "调查",
+    # 价格/走势级别事件
+    "暴涨", "暴跌", "新高", "新低", "突破", "跌破", "闪崩", "插针", "崩盘",
+    # 安全事件
+    "黑客", "被盗", "攻击", "漏洞", "跑路", "盗币",
+    # 资金/机构级别
+    "ETF", "破产", "清算", "爆仓", "收购", "融资", "上市", "退市", "增持", "减持",
+    "巨鲸", "转账",
 ]
 # =======================================
 
@@ -262,9 +278,15 @@ def check_news():
     注册、不需要token），只推送之前没推送过的新文章，避免重复刷屏。
 
     额外加了一层"新鲜度过滤"：不管这条新闻之前有没有见过，只要它的实际发布
-    时间超过 NEWS_MAX_AGE_HOURS，就直接丢弃不推送——这是因为谷歌新闻的搜索
+    时间超过 NEWS_MAX_AGE_HOURS，就直接丢弃不推送——这是因为新闻源的搜索
     结果不完全按时间排序，偶尔会把旧新闻重新翻出来，如果只靠"有没有见过"判断，
     旧新闻第一次出现在结果里时会被误判成"新新闻"推送出去。
+
+    还加了一层"关键词筛选"：标题里命中不到 NEWS_KEYWORDS_MUST_HAVE 列表里任何
+    一个词的，直接当成普通日常快讯过滤掉，不推送，只有真正沾边"大事"的才推送。
+
+    返回一个新闻条目列表 [(标题, 摘要或None, 链接), ...]，不在这里直接推送——
+    推送统一交给 main() 合并成一条消息，减少钉钉机器人的调用次数(有配额限制)。
     """
     all_items = []
     for feed_url in NEWS_RSS_FEEDS:
@@ -275,7 +297,7 @@ def check_news():
 
     if not all_items:
         print("本次没有抓到任何新闻，跳过。")
-        return
+        return []
 
     now = datetime.datetime.now(datetime.timezone.utc)
     fresh_items = []
@@ -302,37 +324,42 @@ def check_news():
         # 第一次运行：只记录当前已有新闻为"已读"，不推送（避免把历史新闻当成新事件一次性刷屏）
         save_seen_news_ids(current_ids)
         print(f"新闻监控首次初始化，记录了 {len(current_ids)} 条现有新闻，之后只推送新出现的。")
-        return
+        return []
 
     new_items = [(title, link) for title, link in fresh_items if link not in seen_ids]
 
-    if not new_items:
-        print("没有新的新闻。")
+    # 关键词筛选："大事"关键词列表命中不到的，直接过滤掉，不当成推送候选
+    important_items = [
+        (title, link) for title, link in new_items
+        if any(kw in title for kw in NEWS_KEYWORDS_MUST_HAVE)
+    ]
+    skipped_count = len(new_items) - len(important_items)
+    if skipped_count:
+        print(f"关键词筛选：过滤掉 {skipped_count} 条普通快讯，不算大事。")
+
+    result = []
+    if not important_items:
+        print("没有命中关键词的新新闻。")
     else:
-        for title, link in new_items[:NEWS_MAX_PUSH_PER_RUN]:
+        for title, link in important_items[:NEWS_MAX_PUSH_PER_RUN]:
             summary = fetch_article_summary(link)
-            if summary:
-                content = f"{title}\n\n📝 {summary}\n\n{link}"
-            else:
-                content = f"{title}\n{link}"
-            push_to_dingtalk("🌐 币圈大事提醒", content)
-        print(f"本次推送了 {min(len(new_items), NEWS_MAX_PUSH_PER_RUN)} 条新新闻。")
+            result.append((title, summary, link))
+        print(f"本次抓到了 {len(result)} 条命中关键词的新新闻，等待合并推送。")
 
     seen_ids.update(current_ids)
     save_seen_news_ids(seen_ids)
+    return result
 
 
 def main():
     last_ts_map = load_last_ts()
-    triggered_any = False
+    volume_alert_msgs = []
 
     for symbol in SYMBOLS:
         try:
             alerts, log_text, new_ts = check_symbol(symbol, last_ts_map.get(symbol))
             print(log_text)
-            for msg in alerts:
-                triggered_any = True
-                push_to_dingtalk(f"合约放量提醒 - {symbol}", msg)
+            volume_alert_msgs.extend(alerts)
             if new_ts:
                 last_ts_map[symbol] = new_ts
         except Exception as e:
@@ -340,14 +367,30 @@ def main():
 
     save_last_ts(last_ts_map)
 
-    if not triggered_any:
+    if volume_alert_msgs:
+        # 多个品种同时触发时，合并成一条消息一次性推送，而不是每个品种单独调用一次钉钉接口
+        combined = "\n\n———\n\n".join(volume_alert_msgs)
+        push_to_dingtalk("合约放量提醒", combined)
+    else:
         print("本次检查没有触发放量条件。")
 
     if NEWS_ENABLED:
         try:
-            check_news()
+            news_items = check_news()
         except Exception as e:
+            news_items = []
             print(f"新闻检查失败: {e}", file=sys.stderr)
+
+        if news_items:
+            # 同样合并成一条消息，最多 NEWS_MAX_PUSH_PER_RUN 条新闻只调用一次钉钉接口
+            parts = []
+            for title, summary, link in news_items:
+                if summary:
+                    parts.append(f"{title}\n📝 {summary}\n{link}")
+                else:
+                    parts.append(f"{title}\n{link}")
+            combined = "\n\n———\n\n".join(parts)
+            push_to_dingtalk("🌐 币圈大事提醒", combined)
 
 
 if __name__ == "__main__":
