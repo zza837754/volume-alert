@@ -45,8 +45,15 @@ NEWS_MAX_AGE_HOURS = 3              # 新鲜度过滤：新闻实际发布时间
 # 换成这个而不是谷歌新闻，是因为谷歌新闻返回的链接是"加密跳转链接"，不是原文
 # 直接地址，导致后面抓取摘要那一步拿到的是谷歌中转页而不是原文内容，摘要抓不到。
 # 金色财经的链接是直接指向原文的真实地址，抓摘要才能正常生效。
-NEWS_RSS_FEEDS = [
-    "https://rsshub.app/jinse/lives/1",
+# RSSHub公共镜像偶尔会被目标网站临时拦截(403)，所以配置多个备用镜像，
+# 第一个连不上就自动依次尝试下一个，只要有一个能用就行。
+NEWS_JINSE_PATH = "/jinse/lives/1"
+NEWS_RSSHUB_MIRRORS = [
+    "https://rsshub.app",
+    "https://rsshub.rssforever.com",
+    "https://hub.slarker.me",
+    "https://rsshub.pseudoyu.com",
+    "https://rss.owo.nz",
 ]
 
 # 关键词筛选：标题里必须命中下面任意一个词，才认为是"大事"，才会推送。
@@ -289,11 +296,15 @@ def check_news():
     推送统一交给 main() 合并成一条消息，减少钉钉机器人的调用次数(有配额限制)。
     """
     all_items = []
-    for feed_url in NEWS_RSS_FEEDS:
+    for mirror in NEWS_RSSHUB_MIRRORS:
+        feed_url = mirror.rstrip("/") + NEWS_JINSE_PATH
         try:
-            all_items.extend(fetch_rss_items(feed_url))
+            all_items = fetch_rss_items(feed_url)
+            if all_items:
+                print(f"新闻源使用镜像: {mirror}")
+                break
         except Exception as e:
-            print(f"抓取新闻源失败 {feed_url}: {e}", file=sys.stderr)
+            print(f"镜像抓取失败 {feed_url}: {e}", file=sys.stderr)
 
     if not all_items:
         print("本次没有抓到任何新闻，跳过。")
