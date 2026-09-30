@@ -21,9 +21,7 @@ import sys
 import re
 import html
 import datetime
-import email.utils
 import requests
-import xml.etree.ElementTree as ET
 
 # ========== 可自行修改的配置 ==========
 # OKX 永续合约命名格式：币种-USDT-SWAP
@@ -38,20 +36,11 @@ VOLUME_THRESHOLDS = {
 }
 
 NEWS_ENABLED = True                 # 是否开启币圈大事新闻推送
-NEWS_STATE_FILE = "seen_news_ids.txt"  # 记录已推送过的新闻链接，避免重复推送
+NEWS_STATE_FILE = "seen_news_ids.txt"  # 记录已推送过的新闻链接/ID，避免重复推送
 NEWS_MAX_PUSH_PER_RUN = 3           # 单次最多推送几条新闻，防止刷屏
 NEWS_MAX_AGE_HOURS = 3              # 新鲜度过滤：新闻实际发布时间超过这个小时数就丢弃，不管是不是"没见过"
-# 新闻来源：金色财经"精选"快讯，通过 RSSHub(开源RSS网关，不需要注册/token)转换。
-# 配置多个第三方公共节点轮询，防止单一节点死掉或被封
-NEWS_RSS_FEEDS = [
-    "https://rsshub.mrss.vip/jinse/lives/1",
-    "https://rsshub.rss.ink/jinse/lives/1",
-    "https://rsshub.umass.pku.edu.cn/jinse/lives/1",
-    "https://rsshub.is-a.dev/jinse/lives/1",
-    "https://rsshub.app/jinse/lives/1",
-]
 
-# 关键词筛选：标题里必须命中下面任意一个词，才认为是"大事"，才会推送。
+# 关键词筛选：标题或内容里必须命中下面任意一个词，才认为是"大事"，才会推送。
 # 命中不到任何词的普通日常快讯直接过滤掉，不推送。可以自己增删这个列表。
 NEWS_KEYWORDS_MUST_HAVE = [
     # 监管/政策/宏观
@@ -66,9 +55,10 @@ NEWS_KEYWORDS_MUST_HAVE = [
     "巨鲸", "转账",
 ]
 
-# 通用请求头，防止 Python 默认请求头被服务器拦截 403
+# 通用请求头，伪装浏览器，防止 HTTP 请求被拦截
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
 }
 # =======================================
 
@@ -120,17 +110,8 @@ def save_last_ts(mapping):
 def check_symbol(symbol: str, last_ts: str | None):
     """
     检查单个品种是否成交量达标。
-    不再用"倍数"比较，改成简单直接的绝对数量判断：这根K线成交了多少个币，
     达到 VOLUME_THRESHOLDS 里设置的数量就推送。
-
-    每次运行时，把上次检查之后新出现的所有K线都补扫一遍（不只是最新一根）——
-    因为 GitHub Actions 定时任务实际执行有延迟，如果只看最新一根，两次运行
-    之间出现又消失的放量K线会被直接跳过，永远检测不到。
-
-    返回 (触发的报警消息列表, 日志文本, 这个品种最新已检查到的K线时间戳)
     """
-    # OKX K线字段：[ts, o, h, l, c, vol(张数), volCcy(币本位数量), volCcyQuote(USDT计价), confirm]
-    # confirm="1" 表示这根K线已收盘，"0" 表示还在进行中
     threshold = VOLUME_THRESHOLDS.get(symbol)
     if threshold is None:
         return [], f"{symbol}: 未设置阈值，跳过", last_ts
@@ -143,7 +124,6 @@ def check_symbol(symbol: str, last_ts: str | None):
         return [], f"{symbol}: 数据不足，跳过", last_ts
 
     if last_ts is None:
-        # 第一次运行：只检查最新一根，不往回补扫历史（避免把老早以前的数据当成新事件推送）
         indices_to_check = [len(closed_klines) - 1]
     else:
         indices_to_check = [i for i, k in enumerate(closed_klines) if k[0] > last_ts]
@@ -189,10 +169,6 @@ def push_to_dingtalk(title: str, content: str):
         print(content)
         return
 
-    # 钉钉自定义机器人：text 消息类型
-    # 如果机器人安全设置选的是"关键词"，消息内容里必须包含那个关键词，
-    # 否则会被钉钉直接拒绝(errcode 310000)。这里统一在标题里补上，
-    # 保证不管是放量提醒还是新闻提醒都能带上关键词。
     if DINGTALK_SECURITY_KEYWORD not in title and DINGTALK_SECURITY_KEYWORD not in content:
         title = f"【{DINGTALK_SECURITY_KEYWORD}】{title}"
 
@@ -207,154 +183,122 @@ def push_to_dingtalk(title: str, content: str):
 
 def load_seen_news_ids():
     if not os.path.exists(NEWS_STATE_FILE):
-        return None  # None 表示这是第一次运行，还没有历史记录
+        return None
     with open(NEWS_STATE_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f if line.strip())
 
 
 def save_seen_news_ids(ids):
-    # 只保留最近1000条，防止文件无限增长
     ids = list(ids)[-1000:]
     with open(NEWS_STATE_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(ids))
 
 
-def fetch_article_summary(url: str, max_len: int = 150):
+def fetch_jinse_lives():
     """
-    打开新闻链接，抓取网页自带的摘要信息（og:description 或 meta description，
-    绝大多数正规新闻网站都会放这个，用来做搜索引擎/社交媒体预览），
-    这样推送里除了标题还能看到一段内容概要。抓取失败就返回 None，不影响整体推送。
+    直连金色财经官方 API 获取最新快讯，免去第三方 RSSHub 依赖。
+    返回 [(id_str, title, content, link, pub_dt), ...]
     """
-    try:
-        resp = requests.get(
-            url, timeout=10, headers=DEFAULT_HEADERS, allow_redirects=True
-        )
-        page_html = resp.text[:200000]  # 只看前面一部分，够找到meta标签了，避免大页面拖慢速度
-
-        patterns = [
-            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, page_html, re.IGNORECASE)
-            if match:
-                summary = html.unescape(match.group(1)).strip()
-                if summary:
-                    return summary[:max_len] + ("…" if len(summary) > max_len else "")
-    except Exception as e:
-        print(f"抓取摘要失败 {url}: {e}", file=sys.stderr)
-    return None
-
-
-def fetch_rss_items(feed_url: str):
-    """
-    拉取并解析一个RSS订阅源，返回 [(标题, 链接, 发布时间datetime或None), ...] 列表。
-    不需要API key，就是普通的HTTP GET + XML解析。
-    """
-    resp = requests.get(feed_url, timeout=15, headers=DEFAULT_HEADERS)
+    url = "https://api.jinse.cn/noauth/v1/lives/list?limit=20"
+    resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=10)
     resp.raise_for_status()
-    root = ET.fromstring(resp.content)
+    data = resp.json()
 
     items = []
-    for item in root.findall(".//item"):
-        title_el = item.find("title")
-        link_el = item.find("link")
-        pubdate_el = item.find("pubDate")
-        title = title_el.text.strip() if title_el is not None and title_el.text else ""
-        link = link_el.text.strip() if link_el is not None and link_el.text else ""
+    # 解析 API 返回数据
+    list_data = data.get("list", [])
+    for group in list_data:
+        for live in group.get("lives", []):
+            live_id = str(live.get("id"))
+            created_at = live.get("created_at")  # 秒级时间戳
+            content_text = live.get("content", "")
 
-        pub_dt = None
-        if pubdate_el is not None and pubdate_el.text:
-            try:
-                pub_dt = email.utils.parsedate_to_datetime(pubdate_el.text.strip())
-                if pub_dt.tzinfo is None:
-                    pub_dt = pub_dt.replace(tzinfo=datetime.timezone.utc)
-            except Exception:
-                pub_dt = None
+            # 清理 HTML 格式
+            content_text = html.unescape(content_text)
+            content_text = re.sub(r'<[^>]+>', '', content_text).strip()
 
-        if title and link:
-            items.append((title, link, pub_dt))
+            # 金色快讯一般格式为【标题】正文内容
+            title_match = re.search(r'【(.*?)】', content_text)
+            if title_match:
+                title = title_match.group(1).strip()
+                summary = content_text.replace(f"【{title}】", "").strip()
+            else:
+                title = content_text[:30] + "..." if len(content_text) > 30 else content_text
+                summary = content_text
+
+            link = f"https://www.jinse.cn/lives/{live_id}.html"
+
+            pub_dt = None
+            if created_at:
+                try:
+                    pub_dt = datetime.datetime.fromtimestamp(int(created_at), tz=datetime.timezone.utc)
+                except Exception:
+                    pub_dt = None
+
+            items.append((live_id, title, summary, link, pub_dt))
     return items
 
 
 def check_news():
     """
-    检查币圈大事新闻：轮询几个主流加密货币新闻网站的官方RSS订阅源（不需要
-    注册、不需要token），只推送之前没推送过的新文章，避免重复刷屏。
-
-    额外加了一层"新鲜度过滤"：不管这条新闻之前有没有见过，只要它的实际发布
-    时间超过 NEWS_MAX_AGE_HOURS，就直接丢弃不推送——这是因为新闻源的搜索
-    结果不完全按时间排序，偶尔会把旧新闻重新翻出来，如果只靠"有没有见过"判断，
-    旧新闻第一次出现在结果里时会被误判成"新新闻"推送出去。
-
-    还加了一层"关键词筛选"：标题里命中不到 NEWS_KEYWORDS_MUST_HAVE 列表里任何
-    一个词的，直接当成普通日常快讯过滤掉，不推送，只有真正沾边"大事"的才推送。
-
-    返回一个新闻条目列表 [(标题, 摘要或None, 链接), ...]，不在这里直接推送——
-    推送统一交给 main() 合并成一条消息，减少钉钉机器人的调用次数(有配额限制)。
+    检查币圈大事新闻：直接轮询金色财经 API，进行时间新鲜度过滤与关键词筛选。
     """
-    all_items = []
-    for feed_url in NEWS_RSS_FEEDS:
-        try:
-            items = fetch_rss_items(feed_url)
-            if items:
-                all_items.extend(items)
-                print(f"成功从镜像抓取 {len(items)} 条新闻: {feed_url}")
-                break  # 只要有一个镜像拉取成功，就无需继续尝试后续镜像
-        except Exception as e:
-            print(f"抓取新闻源失败 {feed_url}: {e}", file=sys.stderr)
+    try:
+        all_items = fetch_jinse_lives()
+        print(f"成功从金色财经官方 API 抓取 {len(all_items)} 条快讯。")
+    except Exception as e:
+        print(f"抓取新闻失败: {e}", file=sys.stderr)
+        return []
 
     if not all_items:
-        print("本次没有抓到任何新闻，跳过。")
         return []
 
     now = datetime.datetime.now(datetime.timezone.utc)
     fresh_items = []
     stale_count = 0
-    for title, link, pub_dt in all_items:
+    for live_id, title, summary, link, pub_dt in all_items:
         if pub_dt is not None:
             age_hours = (now - pub_dt).total_seconds() / 3600
             if age_hours > NEWS_MAX_AGE_HOURS:
                 stale_count += 1
                 continue
-        fresh_items.append((title, link))
+        fresh_items.append((live_id, title, summary, link))
+
     if stale_count:
-        print(f"过滤掉 {stale_count} 条超过{NEWS_MAX_AGE_HOURS}小时的旧新闻。")
+        print(f"过滤掉 {stale_count} 条超过 {NEWS_MAX_AGE_HOURS} 小时的旧快讯。")
 
     seen_ids = load_seen_news_ids()
     first_run = seen_ids is None
     if first_run:
         seen_ids = set()
 
-    # 用链接(url)作为每条新闻的唯一标识
-    current_ids = {link for _, link, _ in all_items}   # 记录全部抓到的，不止新鲜的，避免旧新闻一直反复触发判断
+    current_ids = {live_id for live_id, _, _, _ in fresh_items}
 
     if first_run:
-        # 第一次运行：只记录当前已有新闻为"已读"，不推送（避免把历史新闻当成新事件一次性刷屏）
         save_seen_news_ids(current_ids)
         print(f"新闻监控首次初始化，记录了 {len(current_ids)} 条现有新闻，之后只推送新出现的。")
         return []
 
-    new_items = [(title, link) for title, link in fresh_items if link not in seen_ids]
+    new_items = [item for item in fresh_items if item[0] not in seen_ids]
 
-    # 关键词筛选："大事"关键词列表命中不到的，直接过滤掉，不当成推送候选
+    # 关键词筛选：标题或摘要中包含关键词
     important_items = [
-        (title, link) for title, link in new_items
-        if any(kw in title for kw in NEWS_KEYWORDS_MUST_HAVE)
+        (title, summary, link) for live_id, title, summary, link in new_items
+        if any(kw in title or kw in summary for kw in NEWS_KEYWORDS_MUST_HAVE)
     ]
+
     skipped_count = len(new_items) - len(important_items)
     if skipped_count:
-        print(f"关键词筛选：过滤掉 {skipped_count} 条普通快讯，不算大事。")
+        print(f"关键词筛选：过滤掉 {skipped_count} 条普通日常快讯。")
 
     result = []
     if not important_items:
-        print("没有命中关键词的新新闻。")
+        print("没有命中关键词的新快讯。")
     else:
-        for title, link in important_items[:NEWS_MAX_PUSH_PER_RUN]:
-            summary = fetch_article_summary(link)
-            result.append((title, summary, link))
+        for title, summary, link in important_items[:NEWS_MAX_PUSH_PER_RUN]:
+            # 限制摘要展示长度
+            summary_short = summary[:150] + ("…" if len(summary) > 150 else "") if summary else None
+            result.append((title, summary_short, link))
         print(f"本次抓到了 {len(result)} 条命中关键词的新新闻，等待合并推送。")
 
     seen_ids.update(current_ids)
@@ -379,7 +323,6 @@ def main():
     save_last_ts(last_ts_map)
 
     if volume_alert_msgs:
-        # 多个品种同时触发时，合并成一条消息一次性推送，而不是每个品种单独调用一次钉钉接口
         combined = "\n\n———\n\n".join(volume_alert_msgs)
         push_to_dingtalk("合约放量提醒", combined)
     else:
@@ -393,7 +336,6 @@ def main():
             print(f"新闻检查失败: {e}", file=sys.stderr)
 
         if news_items:
-            # 同样合并成一条消息，最多 NEWS_MAX_PUSH_PER_RUN 条新闻只调用一次钉钉接口
             parts = []
             for title, summary, link in news_items:
                 if summary:
