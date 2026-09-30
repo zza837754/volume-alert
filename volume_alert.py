@@ -42,18 +42,13 @@ NEWS_STATE_FILE = "seen_news_ids.txt"  # 记录已推送过的新闻链接，避
 NEWS_MAX_PUSH_PER_RUN = 3           # 单次最多推送几条新闻，防止刷屏
 NEWS_MAX_AGE_HOURS = 3              # 新鲜度过滤：新闻实际发布时间超过这个小时数就丢弃，不管是不是"没见过"
 # 新闻来源：金色财经"精选"快讯，通过 RSSHub(开源RSS网关，不需要注册/token)转换。
-# 换成这个而不是谷歌新闻，是因为谷歌新闻返回的链接是"加密跳转链接"，不是原文
-# 直接地址，导致后面抓取摘要那一步拿到的是谷歌中转页而不是原文内容，摘要抓不到。
-# 金色财经的链接是直接指向原文的真实地址，抓摘要才能正常生效。
-# RSSHub公共镜像偶尔会被目标网站临时拦截(403)，所以配置多个备用镜像，
-# 第一个连不上就自动依次尝试下一个，只要有一个能用就行。
-NEWS_JINSE_PATH = "/jinse/lives/1"
-NEWS_RSSHUB_MIRRORS = [
-    "https://rsshub.app",
-    "https://rsshub.rssforever.com",
-    "https://hub.slarker.me",
-    "https://rsshub.pseudoyu.com",
-    "https://rss.owo.nz",
+# 配置多个第三方公共节点轮询，防止单一节点死掉或被封
+NEWS_RSS_FEEDS = [
+    "https://rsshub.mrss.vip/jinse/lives/1",
+    "https://rsshub.rss.ink/jinse/lives/1",
+    "https://rsshub.umass.pku.edu.cn/jinse/lives/1",
+    "https://rsshub.is-a.dev/jinse/lives/1",
+    "https://rsshub.app/jinse/lives/1",
 ]
 
 # 关键词筛选：标题里必须命中下面任意一个词，才认为是"大事"，才会推送。
@@ -70,6 +65,11 @@ NEWS_KEYWORDS_MUST_HAVE = [
     "ETF", "破产", "清算", "爆仓", "收购", "融资", "上市", "退市", "增持", "减持",
     "巨鲸", "转账",
 ]
+
+# 通用请求头，防止 Python 默认请求头被服务器拦截 403
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 # =======================================
 
 OKX_KLINES_URL = "https://www.okx.com/api/v5/market/candles"
@@ -85,7 +85,7 @@ def format_candle_time(ts_ms: str) -> str:
 def get_klines(symbol: str, interval: str, limit: int):
     """从OKX合约公开接口获取K线数据，不需要API Key"""
     params = {"instId": symbol, "bar": interval, "limit": limit}
-    resp = requests.get(OKX_KLINES_URL, params=params, timeout=10)
+    resp = requests.get(OKX_KLINES_URL, params=params, headers=DEFAULT_HEADERS, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != "0":
@@ -201,7 +201,7 @@ def push_to_dingtalk(title: str, content: str):
         "msgtype": "text",
         "text": {"content": text},
     }
-    resp = requests.post(webhook, json=data, timeout=10)
+    resp = requests.post(webhook, json=data, headers=DEFAULT_HEADERS, timeout=10)
     print("钉钉返回:", resp.text)
 
 
@@ -227,7 +227,7 @@ def fetch_article_summary(url: str, max_len: int = 150):
     """
     try:
         resp = requests.get(
-            url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True
+            url, timeout=10, headers=DEFAULT_HEADERS, allow_redirects=True
         )
         page_html = resp.text[:200000]  # 只看前面一部分，够找到meta标签了，避免大页面拖慢速度
 
@@ -253,7 +253,7 @@ def fetch_rss_items(feed_url: str):
     拉取并解析一个RSS订阅源，返回 [(标题, 链接, 发布时间datetime或None), ...] 列表。
     不需要API key，就是普通的HTTP GET + XML解析。
     """
-    resp = requests.get(feed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    resp = requests.get(feed_url, timeout=15, headers=DEFAULT_HEADERS)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
 
@@ -296,15 +296,15 @@ def check_news():
     推送统一交给 main() 合并成一条消息，减少钉钉机器人的调用次数(有配额限制)。
     """
     all_items = []
-    for mirror in NEWS_RSSHUB_MIRRORS:
-        feed_url = mirror.rstrip("/") + NEWS_JINSE_PATH
+    for feed_url in NEWS_RSS_FEEDS:
         try:
-            all_items = fetch_rss_items(feed_url)
-            if all_items:
-                print(f"新闻源使用镜像: {mirror}")
-                break
+            items = fetch_rss_items(feed_url)
+            if items:
+                all_items.extend(items)
+                print(f"成功从镜像抓取 {len(items)} 条新闻: {feed_url}")
+                break  # 只要有一个镜像拉取成功，就无需继续尝试后续镜像
         except Exception as e:
-            print(f"镜像抓取失败 {feed_url}: {e}", file=sys.stderr)
+            print(f"抓取新闻源失败 {feed_url}: {e}", file=sys.stderr)
 
     if not all_items:
         print("本次没有抓到任何新闻，跳过。")
