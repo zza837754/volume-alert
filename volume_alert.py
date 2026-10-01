@@ -54,6 +54,8 @@ NEWS_RSS_FEEDS = [
 # "大事"，才会推送。命中不到任何词的普通日常快讯直接过滤掉，不推送。
 # 可以自己增删这个列表。英文关键词匹配不区分大小写。
 NEWS_KEYWORDS_MUST_HAVE = [
+    "",  # ⚠️临时测试用：空字符串能匹配任何新闻，相当于暂时关闭关键词过滤。
+         # 验证完翻译功能正常后，把这一行删掉，恢复正常的关键词筛选。
     # 监管/政策/宏观
     "SEC", "美联储", "加息", "降息", "监管", "立法", "合规", "制裁", "白宫", "特朗普",
     "政府", "央行", "关税", "法案", "起诉", "罚款", "调查",
@@ -223,12 +225,31 @@ def save_seen_news_ids(ids):
 
 def translate_to_chinese(text: str):
     """
-    用谷歌翻译的免费接口(不需要注册、不需要API key，很多开源项目都用这个
-    方式做简单翻译)把英文文本翻成中文。失败就返回None，不影响整体推送——
-    调用方会自动降级成显示英文原文。
+    把英文文本翻成中文，不需要注册、不需要API key。
+    优先用 MyMemory 这个免费翻译接口(对自动化/云服务器请求比较宽容，不容易被
+    限流)，失败了再试谷歌翻译的免费接口作为备用(之前发现谷歌这个接口在
+    GitHub Actions 的共享IP上经常被限流429，所以降级成备用而不是主选)。
+    两个都失败就返回None，不影响整体推送——调用方会自动降级成显示英文原文。
     """
     if not text:
         return None
+
+    # 优先尝试：MyMemory
+    try:
+        resp = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": "en|zh-CN"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        translated = data.get("responseData", {}).get("translatedText", "").strip()
+        if translated and "MYMEMORY WARNING" not in translated.upper():
+            return translated
+    except Exception as e:
+        print(f"MyMemory翻译失败: {e}", file=sys.stderr)
+
+    # 备用：谷歌翻译免费接口
     try:
         resp = requests.get(
             "https://translate.googleapis.com/translate_a/single",
@@ -247,8 +268,9 @@ def translate_to_chinese(text: str):
         translated = "".join(segment[0] for segment in data[0] if segment[0])
         return translated.strip() or None
     except Exception as e:
-        print(f"翻译失败: {e}", file=sys.stderr)
-        return None
+        print(f"谷歌翻译失败: {e}", file=sys.stderr)
+
+    return None
 
 
 def fetch_article_summary(url: str, max_len: int = 150):
