@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 OKX 永续合约 - 成交量达标监控脚本
-逻辑：每根5分钟K线的成交量(按币的数量，比如多少个BTC/ETH)达到设定的阈值，
+逻辑：每根K线的成交量(按币的数量，比如多少个BTC/ETH)达到设定的阈值，
 就通过 钉钉机器人 推送通知到手机。不用倍数比较，直接看绝对数量，逻辑更直接。
+支持同时监控多个(品种,周期,阈值)组合，见 WATCHES 配置——比如可以同时开
+5分钟线(抓瞬间异动)和15分钟线(抓持续性大资金动向)，互不冲突。
 
 每次运行时，把上次检查之后新出现的所有已收盘K线都补扫一遍（不只是最新
 一根）——因为 GitHub Actions 定时任务实际执行有延迟，如果只看最新一根，
@@ -26,16 +28,15 @@ import requests
 import xml.etree.ElementTree as ET
 
 # ========== 可自行修改的配置 ==========
-# OKX 永续合约命名格式：币种-USDT-SWAP
-SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]   # 想监控的合约品种，可自行增删
-INTERVAL = "5m"                     # K线周期：1m, 3m, 5m, 15m, 1H ...
-
-# 绝对数量阈值：每根K线的成交量(按币的数量，不是USDT金额)达到这个数就推送
-# 不同币价格差异大，所以每个品种分开设置
-VOLUME_THRESHOLDS = {
-    "BTC-USDT-SWAP": 3000,      # 5分钟内成交达到 3000 个 BTC 才推送(日常大多100~800，这是好几倍)
-    "ETH-USDT-SWAP": 80000,     # 5分钟内成交达到 80000 个 ETH 才推送(日常大多几千到几万，真异动常见到90K~150K)
-}
+# 同时监控多个(品种, 周期, 阈值)组合：5分钟线抓"刚发生的瞬间异动"，
+# 15分钟线抓"持续性的大资金动向"，两者互不冲突，可以同时开。
+# OKX 永续合约命名格式：币种-USDT-SWAP。想增删品种或周期，照着格式加一行就行。
+WATCHES = [
+    {"symbol": "BTC-USDT-SWAP", "interval": "5m",  "threshold": 3000},
+    {"symbol": "BTC-USDT-SWAP", "interval": "15m", "threshold": 7500},
+    {"symbol": "ETH-USDT-SWAP", "interval": "5m",  "threshold": 80000},
+    {"symbol": "ETH-USDT-SWAP", "interval": "15m", "threshold": 200000},
+]
 
 NEWS_ENABLED = True                 # 是否开启币圈大事新闻推送
 NEWS_STATE_FILE = "seen_news_ids.txt"  # 记录已推送过的新闻链接，避免重复推送
@@ -101,6 +102,10 @@ VOLUME_STATE_FILE = "seen_volume_ts.txt"  # 记录每个品种已经检查到哪
 
 
 def load_last_ts():
+    """
+    state_key 本身可能带冒号(比如 "BTC-USDT-SWAP:5m")，所以从右边切分
+    (rsplit)取最后一段当时间戳，前面剩下的整体当key，避免冲突切错。
+    """
     if not os.path.exists(VOLUME_STATE_FILE):
         return {}
     result = {}
@@ -109,40 +114,38 @@ def load_last_ts():
             line = line.strip()
             if not line or ":" not in line:
                 continue
-            symbol, ts = line.split(":", 1)
-            result[symbol] = ts
+            state_key, ts = line.rsplit(":", 1)
+            result[state_key] = ts
     return result
 
 
 def save_last_ts(mapping):
     with open(VOLUME_STATE_FILE, "w", encoding="utf-8") as f:
-        f.write("\n".join(f"{s}:{t}" for s, t in mapping.items()))
+        f.write("\n".join(f"{k}:{t}" for k, t in mapping.items()))
 
 
-def check_symbol(symbol: str, last_ts: str | None):
+def check_symbol(symbol: str, interval: str, threshold: float, last_ts: str | None):
     """
-    检查单个品种是否成交量达标。
+    检查单个(品种,周期)组合是否成交量达标。
     不再用"倍数"比较，改成简单直接的绝对数量判断：这根K线成交了多少个币，
-    达到 VOLUME_THRESHOLDS 里设置的数量就推送。
+    达到设定的阈值就推送。
 
     每次运行时，把上次检查之后新出现的所有K线都补扫一遍（不只是最新一根）——
     因为 GitHub Actions 定时任务实际执行有延迟，如果只看最新一根，两次运行
     之间出现又消失的放量K线会被直接跳过，永远检测不到。
 
-    返回 (触发的报警消息列表, 日志文本, 这个品种最新已检查到的K线时间戳)
+    返回 (触发的报警消息列表, 日志文本, 这个组合最新已检查到的K线时间戳)
     """
     # OKX K线字段：[ts, o, h, l, c, vol(张数), volCcy(币本位数量), volCcyQuote(USDT计价), confirm]
     # confirm="1" 表示这根K线已收盘，"0" 表示还在进行中
-    threshold = VOLUME_THRESHOLDS.get(symbol)
-    if threshold is None:
-        return [], f"{symbol}: 未设置阈值，跳过", last_ts
-
     fetch_limit = MAX_CANDLES_TO_SCAN + 2
-    klines = get_klines(symbol, INTERVAL, fetch_limit)
+    klines = get_klines(symbol, interval, fetch_limit)
     closed_klines = [k for k in klines if k[8] == "1"]  # 只保留已收盘的K线，从旧到新排列
 
+    tag = f"{symbol}({interval})"
+
     if not closed_klines:
-        return [], f"{symbol}: 数据不足，跳过", last_ts
+        return [], f"{tag}: 数据不足，跳过", last_ts
 
     if last_ts is None:
         # 第一次运行：只检查最新一根，不往回补扫历史（避免把老早以前的数据当成新事件推送）
@@ -163,21 +166,21 @@ def check_symbol(symbol: str, last_ts: str | None):
             price = float(current[4])
             candle_time = format_candle_time(current[0])
             msg = (
-                f"🚨 {symbol} 5分钟成交量达标！\n"
+                f"🚨 {tag} 成交量达标！\n"
                 f"K线时间: {candle_time}（北京时间）\n"
                 f"成交量: {current_vol_coin:,.1f} {coin_symbol}（阈值 {threshold:,}）\n"
                 f"成交额: {current_vol_usdt:,.0f} USDT\n"
                 f"最新价: {price}"
             )
             alerts.append(msg)
-            log_lines.append(f"{symbol}: 🚨 成交量 {current_vol_coin:,.1f}，达标（已触发推送）")
+            log_lines.append(f"{tag}: 🚨 成交量 {current_vol_coin:,.1f}，达标（已触发推送）")
         else:
             log_lines.append(
-                f"{symbol}: 成交量 {current_vol_coin:,.1f} {coin_symbol}，未达阈值 {threshold:,}"
+                f"{tag}: 成交量 {current_vol_coin:,.1f} {coin_symbol}，未达阈值 {threshold:,}"
             )
 
     new_last_ts = closed_klines[-1][0]  # 不管有没有触发，都更新到最新收盘K线的时间戳
-    log_text = "\n".join(log_lines) if log_lines else f"{symbol}: 没有需要检查的新K线"
+    log_text = "\n".join(log_lines) if log_lines else f"{tag}: 没有需要检查的新K线"
     return alerts, log_text, new_last_ts
 
 
@@ -421,15 +424,21 @@ def main():
     last_ts_map = load_last_ts()
     volume_alert_msgs = []
 
-    for symbol in SYMBOLS:
+    for watch in WATCHES:
+        symbol = watch["symbol"]
+        interval = watch["interval"]
+        threshold = watch["threshold"]
+        state_key = f"{symbol}:{interval}"   # 同一个品种不同周期要分开记录检查进度，不能共用
         try:
-            alerts, log_text, new_ts = check_symbol(symbol, last_ts_map.get(symbol))
+            alerts, log_text, new_ts = check_symbol(
+                symbol, interval, threshold, last_ts_map.get(state_key)
+            )
             print(log_text)
             volume_alert_msgs.extend(alerts)
             if new_ts:
-                last_ts_map[symbol] = new_ts
+                last_ts_map[state_key] = new_ts
         except Exception as e:
-            print(f"{symbol} 检查失败: {e}", file=sys.stderr)
+            print(f"{symbol}({interval}) 检查失败: {e}", file=sys.stderr)
 
     save_last_ts(last_ts_map)
 
