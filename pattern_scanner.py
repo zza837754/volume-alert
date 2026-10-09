@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-OKX 永续合约 - 山寨币"冲高回落后 均线缠绕小阳小阴震荡"形态扫描
+OKX 永续合约 - 山寨币"均线粘合横盘 → 突然拉针冲高 → 迅速回落"（假突破/诱多）扫描
 
-对应截图里红圈的走势：
-  1) 前面有一波拉升，冲到高点后回落（下跌趋势中）
-  2) 回落后出现一段小实体K线的震荡反弹，价格在 MA7 / MA25 附近来回缠绕
-  3) 反弹没能有效站上 MA25（下跌中继），量能没有放大
-  之后常见走势：反弹乏力继续下跌（偏空信号）
+对应最新截图红圈的走势：
+  1) 价格横盘，MA7 / MA25 / MA99 粘在一起（缠绕收敛）
+  2) 突然一根大阳线/长上影线冲出横盘上沿，常常冲到前高附近
+  3) 随后几根K线迅速回落，收盘跌回横盘区间里面（突破失败）
+  之后常见走势：诱多结束，顺势下跌（偏空信号）
 
-每次运行：扫描成交额靠前的山寨币，命中形态就合并成一条钉钉消息推送。
+每次运行：扫描成交额靠前的山寨币，命中就合并成一条钉钉消息推送。
 独立文件，不依赖 volume_alert.py，直接运行即可。
 """
 
@@ -52,29 +52,24 @@ def push_to_dingtalk(title, content):
 
 # ========== 可调参数 ==========
 BAR = "15m"                 # 扫描周期，截图看不出周期，默认15分钟，可改 "5m"/"1h"
-TOP_N = 120                 # 只扫成交额前N的山寨币（流动性太差的币形态不可靠）
+TOP_N = 120                 # 只扫成交额前N的山寨币
 MIN_TURNOVER_USDT = 5_000_000   # 24h成交额下限
-EXCLUDE = {"BTC", "ETH"}    # 不扫的币（大饼以太另有监控）
+EXCLUDE = {"BTC", "ETH"}    # 不扫的币
 
-PEAK_LOOKBACK = 80          # 往回找前高的范围(根)
-PEAK_MIN_AGO = 8            # 前高至少在多少根之前（保证已经回落了一段）
-DROP_FROM_PEAK_MIN = 0.05   # 当前价比前高至少低 5%
-PUMP_MIN = 0.08             # 前高比前高之前30根的最低价至少高 8%（确实拉升过）
+BASE_WIN = 16               # 冲高前的横盘窗口（根）
+BASE_RANGE_MAX = 0.04       # 横盘窗口内 最高-最低 不超过 4%
+MA_CONVERGE_MAX = 0.02      # 冲高前一根：MA7/MA25/MA99 最大最小相差不超过 2%（粘合）
 
-WIN = 8                     # 震荡窗口：最近8根K线
-WIN_RANGE_MAX = 0.04        # 窗口内 最高-最低 不超过 4%
-MA_GAP_MAX = 0.015          # 最新一根 MA7 与 MA25 相距不超过 1.5%（缠绕）
-MA7_CROSS_MIN = 2           # 窗口内收盘价上下穿越 MA7 至少2次（来回缠绕）
-BELOW_MA25_TOL = 0.015      # 窗口内最高价不超过 MA25 的 1.5%（没能站上）
-VOL_SHRINK_RATIO = 1.0      # 窗口均量 <= 之前20根均量 * 该比例（量不放大）
+SPIKE_MIN = 0.015           # 冲高K线的最高价，至少高出横盘上沿 1.5%
+SPIKE_VOL_RATIO = 1.2       # 冲高K线成交量 >= 之前20根均量 * 该倍数（放量冲高）
+SPIKE_MAX_AGO = 6           # 冲高K线必须在最近 6 根以内
+NEAR_PEAK_TOL = 0.015       # 冲高高点与前高相差不超过 1.5%，标注"二次冲高到前高"（只标注，不强制）
 
-COOLDOWN_BARS = 12          # 同一个币触发后，多少根K线内不重复推送
 MAX_PUSH = 8                # 单次最多推多少个币
 STATE_FILE = "seen_pattern_ts.txt"
 # ==============================
 
 TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
-BAR_MS = {"5m": 5, "15m": 15, "30m": 30, "1H": 60, "1h": 60}
 
 
 def ma(values, n, end):
@@ -88,10 +83,10 @@ def ma(values, n, end):
 def detect(klines):
     """
     klines: 已收盘K线，从旧到新，每根 [ts,o,h,l,c,vol,volCcy,volQuote,confirm]
-    命中返回信息字典，否则返回 None
+    命中返回信息字典（含冲高K线时间 spike_ts，用来去重），否则返回 None
     """
     n = len(klines)
-    if n < 110:
+    if n < 130:
         return None
     o = [float(k[1]) for k in klines]
     h = [float(k[2]) for k in klines]
@@ -100,70 +95,54 @@ def detect(klines):
     v = [float(k[6]) for k in klines]
     i = n - 1
 
-    # 1) 冲高回落
-    lo_idx = max(0, i - PEAK_LOOKBACK)
-    peak_idx = max(range(lo_idx, i + 1), key=lambda x: h[x])
-    peak = h[peak_idx]
-    if i - peak_idx < PEAK_MIN_AGO:
-        return None
-    drop = (peak - c[i]) / peak
-    if drop < DROP_FROM_PEAK_MIN:
-        return None
-    base_lo = min(l[max(0, peak_idx - 30):peak_idx + 1])
-    if base_lo <= 0 or (peak - base_lo) / base_lo < PUMP_MIN:
-        return None
+    # 从最近往前找冲高K线 s（s < i，也就是冲高之后至少已经有一根收盘K线确认）
+    for s in range(i - 1, max(i - SPIKE_MAX_AGO, BASE_WIN + 20) - 1, -1):
+        b0 = s - BASE_WIN
+        base_hi = max(h[b0:s])
+        base_lo = min(l[b0:s])
+        if base_lo <= 0 or (base_hi - base_lo) / c[s - 1] > BASE_RANGE_MAX:
+            continue
 
-    # 2) 下跌趋势：MA25 向下，价格不在 MA25 上方
-    ma7 = ma(c, 7, i)
-    ma25 = ma(c, 25, i)
-    ma25_prev = ma(c, 25, i - 8)
-    ma99 = ma(c, 99, i)
-    if None in (ma7, ma25, ma25_prev) or ma25 >= ma25_prev:
-        return None
-    if c[i] > ma25 * (1 + BELOW_MA25_TOL):
-        return None
+        # 冲高：最高价明显冲出横盘上沿
+        if h[s] < base_hi * (1 + SPIKE_MIN):
+            continue
 
-    # 3) 震荡缠绕
-    w0 = i - WIN + 1
-    win_hi = max(h[w0:i + 1])
-    win_lo = min(l[w0:i + 1])
-    if (win_hi - win_lo) / c[i] > WIN_RANGE_MAX:
-        return None
-    if abs(ma7 - ma25) / ma25 > MA_GAP_MAX:
-        return None
-    crosses = 0
-    for j in range(w0 + 1, i + 1):
-        m_prev, m_cur = ma(c, 7, j - 1), ma(c, 7, j)
-        if (c[j - 1] - m_prev) * (c[j] - m_cur) < 0:
-            crosses += 1
-    if crosses < MA7_CROSS_MIN:
-        return None
-    # 反弹没能有效站上 MA25
-    for j in range(w0, i + 1):
-        m25 = ma(c, 25, j)
-        if h[j] > m25 * (1 + BELOW_MA25_TOL):
-            return None
+        # 冲高前均线粘合
+        m7 = ma(c, 7, s - 1)
+        m25 = ma(c, 25, s - 1)
+        m99 = ma(c, 99, s - 1)
+        if None in (m7, m25, m99):
+            continue
+        if (max(m7, m25, m99) - min(m7, m25, m99)) / m25 > MA_CONVERGE_MAX:
+            continue
 
-    # 4) 量能不放大
-    win_vol = sum(v[w0:i + 1]) / WIN
-    prev_vol = sum(v[w0 - 20:w0]) / 20
-    if prev_vol <= 0 or win_vol > prev_vol * VOL_SHRINK_RATIO:
-        return None
+        # 放量冲高
+        prev_vol = sum(v[s - 20:s]) / 20
+        if prev_vol <= 0 or v[s] < prev_vol * SPIKE_VOL_RATIO:
+            continue
 
-    breakdown = c[i] < min(l[w0:i])   # 最新收盘跌破窗口前面所有低点
-    return {
-        "ts": klines[i][0],
-        "price": c[i],
-        "drop": drop,
-        "peak": peak,
-        "ma7": ma7,
-        "ma25": ma25,
-        "ma99": ma99,
-        "range": (win_hi - win_lo) / c[i],
-        "crosses": crosses,
-        "vol_ratio": win_vol / prev_vol,
-        "breakdown": breakdown,
-    }
+        # 突破失败：冲高之后，最新收盘已经跌回横盘区间里面，且低于冲高那根的开盘价
+        if not (c[i] < base_hi and c[i] < o[s]):
+            continue
+
+        prior_peak = max(h[max(0, s - 100):s])
+        near_peak = abs(h[s] - prior_peak) / prior_peak <= NEAR_PEAK_TOL or h[s] >= prior_peak
+        return {
+            "spike_ts": klines[s][0],
+            "ts": klines[i][0],
+            "price": c[i],
+            "spike_high": h[s],
+            "base_hi": base_hi,
+            "base_lo": base_lo,
+            "spike_pct": (h[s] - base_hi) / base_hi,
+            "vol_ratio": v[s] / prev_vol,
+            "ma_gap": (max(m7, m25, m99) - min(m7, m25, m99)) / m25,
+            "near_peak": near_peak,
+            "prior_peak": prior_peak,
+            "below_ma25": c[i] < ma(c, 25, i),
+            "bars_after": i - s,
+        }
+    return None
 
 
 def load_state():
@@ -207,8 +186,6 @@ def list_candidates():
 
 def main():
     state = load_state()
-    bar_min = BAR_MS.get(BAR, 15)
-    cooldown_ms = COOLDOWN_BARS * bar_min * 60 * 1000
 
     symbols = list_candidates()
     print(f"本次扫描 {len(symbols)} 个币 ({BAR})")
@@ -216,7 +193,7 @@ def main():
     hits = []
     for sym in symbols:
         try:
-            ks = get_klines(sym, BAR, 130)
+            ks = get_klines(sym, BAR, 150)
             closed = [k for k in ks if k[8] == "1"]
             r = detect(closed)
         except Exception as e:
@@ -228,9 +205,9 @@ def main():
         if not r:
             continue
         last = state.get(sym)
-        if last and int(r["ts"]) - int(last) < cooldown_ms:
+        if last and int(r["spike_ts"]) <= int(last):   # 同一根冲高K线只推一次
             continue
-        state[sym] = r["ts"]
+        state[sym] = r["spike_ts"]
         hits.append((sym, r))
 
     save_state(state)
@@ -239,19 +216,23 @@ def main():
         print("本次没有命中形态。")
         return
 
-    hits.sort(key=lambda x: x[1]["drop"], reverse=True)
+    hits.sort(key=lambda x: x[1]["spike_pct"], reverse=True)
     parts = []
     for sym, r in hits[:MAX_PUSH]:
-        tag = "🔻已跌破震荡低点" if r["breakdown"] else "⏳震荡中，等待方向"
+        tags = []
+        if r["near_peak"]:
+            tags.append("二次冲高到前高")
+        if r["below_ma25"]:
+            tags.append("已跌破MA25")
+        tag = "｜".join(tags) if tags else "冲高失败"
         parts.append(
-            f"📉 {sym.replace('-SWAP', '')} ({BAR}) {tag}\n"
-            f"K线时间: {format_candle_time(r['ts'])}（北京时间）\n"
-            f"现价: {r['price']}（距前高 -{r['drop']*100:.1f}%，前高 {r['peak']}）\n"
-            f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g}"
-            + (f" / MA99 {r['ma99']:.6g}" if r["ma99"] else "")
-            + f"\n震荡幅度 {r['range']*100:.1f}%，穿越MA7 {r['crosses']}次，量能比 {r['vol_ratio']:.2f}"
+            f"📉 {sym.replace('-SWAP', '')} ({BAR}) 假突破回落 [{tag}]\n"
+            f"冲高K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
+            f"冲高最高 {r['spike_high']}（高出横盘上沿 {r['spike_pct']*100:.1f}%），前高 {r['prior_peak']}\n"
+            f"横盘区间 {r['base_lo']} ~ {r['base_hi']}，现价 {r['price']}（已跌回区间内）\n"
+            f"冲高前均线粘合度 {r['ma_gap']*100:.2f}%，冲高量能 {r['vol_ratio']:.1f} 倍"
         )
-    push_to_dingtalk("合约形态提醒：冲高回落后均线缠绕", "\n\n———\n\n".join(parts))
+    push_to_dingtalk("合约形态提醒：均线粘合后冲高回落", "\n\n———\n\n".join(parts))
 
 
 if __name__ == "__main__":
