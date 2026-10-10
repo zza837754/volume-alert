@@ -52,8 +52,8 @@ def push_to_dingtalk(title, content):
 
 # ========== 可调参数 ==========
 BAR = "15m"                 # 扫描周期，截图看不出周期，默认15分钟，可改 "5m"/"1h"
-TOP_N = 120                 # 只扫成交额前N的山寨币
-MIN_TURNOVER_USDT = 5_000_000   # 24h成交额下限
+TOP_N = 300                 # 只扫成交额前N的山寨币
+MIN_TURNOVER_USDT = 2_000_000   # 24h成交额下限
 EXCLUDE = {"BTC", "ETH"}    # 不扫的币
 
 BASE_WIN = 16               # 冲高前的横盘窗口（根）
