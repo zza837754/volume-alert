@@ -6,6 +6,9 @@ OKX 永续合约 - 山寨币形态扫描（做空 / 做多 三种形态），命
 【偏多】放量突破：均线粘合横盘 → 放量冲出上沿 → 收盘站稳在上沿之上
 【偏多】强势回调再启动：先暴拉一波 → 回调（不破位）→ 重新站上 MA7/MA25、MA7 上翘（可能再创新高）
 
+【偏空】放量下破：放量跌出横盘下沿，收盘站稳在下沿之下（放量突破的镜像）
+【偏空】弱势反弹再下跌：先暴跌一波 → 反弹不过分 → 重新跌破 MA25（强势回调再启动的镜像）
+
 【顺势】趋势回踩进场（做多/做空）：MA25>MA99 且双双向上，缩量回踩到 MA25 附近不破 MA99，
         出现收盘越过上一根极值的反转K线时推送，附带止损位和目标位，盈亏比不到 1.5 的不推。
 
@@ -324,7 +327,7 @@ def detect_trend_pullback(klines, side):
 
 FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
 # 每种形态的方向：long 做多 / short 做空
-SIDE = {"fake": "short", "breakout": "long", "restart": "long", "trend_long": "long", "trend_short": "short"}
+SIDE = {"fake": "short", "breakout": "long", "restart": "long", "breakdown": "short", "weak_restart": "short", "trend_long": "long", "trend_short": "short"}
 
 
 def get_funding(inst_id):
@@ -360,6 +363,41 @@ def in_funding_window(now_utc=None):
         if t - FUNDING_BEFORE_MIN <= m <= t + FUNDING_AFTER_MIN:
             return True
     return False
+
+
+def invert_klines(klines):
+    """价格取倒数（O,H,L,C -> 1/O,1/L,1/H,1/C），这样偏多的检测逻辑就能直接用来找偏空形态"""
+    return [[k[0], 1 / float(k[1]), 1 / float(k[3]), 1 / float(k[2]), 1 / float(k[4]), k[5], k[6], k[7], k[8]]
+            for k in klines]
+
+
+def detect_breakdown(klines):
+    """偏空：均线粘合横盘后放量跌出下沿，收盘站稳在下沿之下（放量突破的镜像）"""
+    r = detect_breakout(invert_klines(klines))
+    if not r:
+        return None
+    return {
+        "key_ts": r["key_ts"], "spike_ts": r["spike_ts"], "ts": r["ts"],
+        "bars_after": r["bars_after"], "vol_ratio": r["vol_ratio"], "ma_gap": r["ma_gap"],
+        "near_low": r["near_peak"], "spike_pct": r["spike_pct"],
+        "price": 1 / r["price"], "spike_low": 1 / r["spike_high"],
+        "base_lo": 1 / r["base_hi"], "base_hi": 1 / r["base_lo"],
+    }
+
+
+def detect_weak_restart(klines):
+    """偏空：暴跌 → 反弹 → 重新跌破 MA25 和 MA7（强势回调再启动的镜像）"""
+    r = detect_pullback_restart(invert_klines(klines))
+    if not r:
+        return None
+    c = [float(k[4]) for k in klines]
+    i = len(c) - 1
+    return {
+        "key_ts": r["key_ts"], "ts": r["ts"], "price": c[i],
+        "trough": 1 / r["peak"], "drop_pct": r["pump_pct"] / (1 + r["pump_pct"]),
+        "retrace": r["retrace"], "new_low": r["new_high"], "bars_after": r["bars_after"],
+        "ma7": ma(c, 7, i), "ma25": ma(c, 25, i), "ma99": ma(c, 99, i),
+    }
 
 
 def load_state():
@@ -409,7 +447,7 @@ def fmt_fake(sym, r):
         tags.append("已跌破MA25")
     tag = "｜".join(tags) if tags else "冲高失败"
     return (
-        f"📉 {sym.replace('-SWAP', '')} ({BAR}) 假突破回落 [{tag}]\n"
+        f"📉 做空 {sym.replace('-SWAP', '')} ({BAR}) 假突破回落 [{tag}]\n"
         f"冲高K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
         f"冲高最高 {r['spike_high']}（高出横盘上沿 {r['spike_pct']*100:.1f}%），前高 {r['prior_peak']}\n"
         f"横盘区间 {r['base_lo']} ~ {r['base_hi']}，现价 {r['price']}（已跌回区间内）\n"
@@ -420,7 +458,7 @@ def fmt_fake(sym, r):
 def fmt_breakout(sym, r):
     tag = "突破前高" if r["near_peak"] else "突破横盘"
     return (
-        f"📈 {sym.replace('-SWAP', '')} ({BAR}) 放量突破 [{tag}]\n"
+        f"📈 做多 {sym.replace('-SWAP', '')} ({BAR}) 放量突破 [{tag}]\n"
         f"突破K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
         f"冲高最高 {r['spike_high']}（高出横盘上沿 {r['spike_pct']*100:.1f}%），现价 {r['price']}（站稳上沿 {r['base_hi']} 之上）\n"
         f"横盘区间 {r['base_lo']} ~ {r['base_hi']}\n"
@@ -431,7 +469,7 @@ def fmt_breakout(sym, r):
 def fmt_restart(sym, r):
     tag = "已创新高" if r["new_high"] else "回调后再启动"
     return (
-        f"📈 {sym.replace('-SWAP', '')} ({BAR}) 强势回调再启动 [{tag}]\n"
+        f"📈 做多 {sym.replace('-SWAP', '')} ({BAR}) 强势回调再启动 [{tag}]\n"
         f"站上MA25: {format_candle_time(r['key_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
         f"前一波拉升 +{r['pump_pct']*100:.0f}%（高点 {r['peak']}），回调了 {r['retrace']*100:.0f}%，现价 {r['price']}\n"
         f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
@@ -449,11 +487,34 @@ def fmt_trend(sym, r):
     )
 
 
+def fmt_breakdown(sym, r):
+    tag = "跌破前低" if r["near_low"] else "跌破横盘"
+    return (
+        f"📉 做空 {sym.replace('-SWAP', '')} ({BAR}) 放量下破 [{tag}]\n"
+        f"下破K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
+        f"下探最低 {r['spike_low']}（低于横盘下沿 {r['spike_pct']*100:.1f}%），现价 {r['price']}（站稳下沿 {r['base_lo']} 之下）\n"
+        f"横盘区间 {r['base_lo']} ~ {r['base_hi']}\n"
+        f"下破前均线粘合度 {r['ma_gap']*100:.2f}%，下破量能 {r['vol_ratio']:.1f} 倍"
+    )
+
+
+def fmt_weak_restart(sym, r):
+    tag = "已创新低" if r["new_low"] else "反弹后再下跌"
+    return (
+        f"📉 做空 {sym.replace('-SWAP', '')} ({BAR}) 弱势反弹再下跌 [{tag}]\n"
+        f"跌破MA25: {format_candle_time(r['key_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
+        f"前一波下跌约 -{r['drop_pct']*100:.0f}%（低点 {r['trough']:.6g}），反弹了 {r['retrace']*100:.0f}%，现价 {r['price']}\n"
+        f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
+    )
+
+
 # 形态名 -> (检测函数, 推送格式, 钉钉标题)
 PATTERNS = {
     "fake": (detect_fake_breakout, fmt_fake, "合约形态提醒【偏空】均线粘合后冲高回落"),
     "breakout": (detect_breakout, fmt_breakout, "合约形态提醒【偏多】均线粘合后放量突破"),
     "restart": (detect_pullback_restart, fmt_restart, "合约形态提醒【偏多】强势回调再启动"),
+    "breakdown": (detect_breakdown, fmt_breakdown, "合约形态提醒【偏空】均线粘合后放量下破"),
+    "weak_restart": (detect_weak_restart, fmt_weak_restart, "合约形态提醒【偏空】弱势反弹再下跌"),
     "trend_long": (lambda k: detect_trend_pullback(k, "long"), fmt_trend, "合约形态提醒【偏多】趋势回踩进场"),
     "trend_short": (lambda k: detect_trend_pullback(k, "short"), fmt_trend, "合约形态提醒【偏空】趋势回踩进场"),
 }
