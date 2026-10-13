@@ -54,22 +54,23 @@ def push_to_dingtalk(title, content):
     print("钉钉返回:", resp.text)
 
 # ========== 可调参数 ==========
-BAR = "15m"                 # 扫描周期，截图看不出周期，默认15分钟，可改 "5m"/"1h"
+BAR = "5m"                  # 扫描周期：5m 更快（信号延迟小），15m 更稳；改了周期后阈值也要相应调
 TOP_N = 300                 # 只扫成交额前N的山寨币
 MIN_TURNOVER_USDT = 2_000_000   # 24h成交额下限
 EXCLUDE = {"BTC", "ETH"}    # 不扫的币
 
 BASE_WIN = 16               # 冲高前的横盘窗口（根）
-BASE_RANGE_MAX = 0.04       # 横盘窗口内 最高-最低 不超过 4%
+BASE_RANGE_MAX = 0.03       # 横盘窗口内 最高-最低 不超过 3%（5分钟线；15分钟线可用 0.04）
 MA_CONVERGE_MAX = 0.02      # 冲高前一根：MA7/MA25/MA99 最大最小相差不超过 2%（粘合）
 
-SPIKE_MIN = 0.015           # 冲高K线的最高价，至少高出横盘上沿 1.5%
+SPIKE_MIN = 0.01            # 冲高K线的最高价，至少高出横盘上沿 1%（5分钟线；15分钟线可用 0.015）
 SPIKE_VOL_RATIO = 1.2       # 冲高K线成交量 >= 之前20根均量 * 该倍数（放量冲高）
 SPIKE_MAX_AGO = 6           # 冲高K线必须在最近 6 根以内
 NEAR_PEAK_TOL = 0.015       # 冲高高点与前高相差不超过 1.5%，标注"二次冲高到前高"（只标注，不强制）
 
 # --- 放量突破（偏多）---
 BREAKOUT_HOLD = 0.003       # 最新收盘要高出横盘上沿至少 0.3%，且冲高后每根收盘都在上沿之上
+BREAKOUT_MAX_EXTEND = 0.025 # 追高过滤：现价离横盘上沿超过 2.5% 就不推（已经拉出去一大截，盈亏比差）
 
 # --- 强势回调再启动（偏多）---
 PUMP_UP_MIN = 0.15          # 前面那波拉升幅度至少 15%（峰值相对前面30根最低价）
@@ -140,7 +141,7 @@ def spike_candidates(klines):
         return
     o, h, l, c, v = _arrays(klines)
     i = n - 1
-    for s in range(i - 1, max(i - SPIKE_MAX_AGO, BASE_WIN + 20) - 1, -1):
+    for s in range(i, max(i - SPIKE_MAX_AGO, BASE_WIN + 20) - 1, -1):   # s=i：冲高K线刚收盘就能发现，不用再等一根
         b0 = s - BASE_WIN
         base_hi = max(h[b0:s])
         base_lo = min(l[b0:s])
@@ -187,6 +188,8 @@ def detect_breakout(klines):
     for r in spike_candidates(klines):
         c, i, s = r["c"], r["i"], r["s"]
         line = r["base_hi"] * (1 + BREAKOUT_HOLD)
+        if (c[i] - r["base_hi"]) / r["base_hi"] > BREAKOUT_MAX_EXTEND:    # 追高过滤
+            continue
         if all(c[j] > line for j in range(s, i + 1)) and c[i] > ma(c, 25, i):
             r["price"] = c[i]
             r["key_ts"] = r["spike_ts"]
