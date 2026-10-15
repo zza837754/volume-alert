@@ -9,6 +9,9 @@ OKX 永续合约 - 山寨币形态扫描（做空 / 做多 三种形态），命
 【偏空】放量下破：放量跌出横盘下沿，收盘站稳在下沿之下（放量突破的镜像）
 【偏空】弱势反弹再下跌：先暴跌一波 → 反弹不过分 → 重新跌破 MA25（强势回调再启动的镜像）
 
+【更快】反弹受阻（做空）/ 回踩企稳（做多）：下跌中小幅反弹碰到 MA7/MA25 没能站上，
+        出现第一根确认阴线就推送（不用等大阴线砸下去）；做多是它的镜像。
+
 【顺势】趋势回踩进场（做多/做空）：MA25>MA99 且双双向上，缩量回踩到 MA25 附近不破 MA99，
         出现收盘越过上一根极值的反转K线时推送，附带止损位和目标位，盈亏比不到 1.5 的不推。
 
@@ -20,6 +23,7 @@ import sys
 import time
 
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 import requests
 
 DINGTALK_SECURITY_KEYWORD = "合约"   # 要和钉钉机器人"自定义关键词"一致
@@ -55,8 +59,8 @@ def push_to_dingtalk(title, content):
 
 # ========== 可调参数 ==========
 BAR = "5m"                  # 扫描周期：5m 更快（信号延迟小），15m 更稳；改了周期后阈值也要相应调
-TOP_N = 300                 # 只扫成交额前N的山寨币
-MIN_TURNOVER_USDT = 2_000_000   # 24h成交额下限
+TOP_N = 150                 # 只扫成交额前N的币（小盘币不扫）
+MIN_TURNOVER_USDT = 20_000_000  # OKX 24h成交额下限（2000万U），小盘币不推；还嫌多就继续调大
 EXCLUDE = {"BTC", "ETH"}    # 不扫的币
 
 BASE_WIN = 16               # 冲高前的横盘窗口（根）
@@ -66,6 +70,7 @@ MA_CONVERGE_MAX = 0.02      # 冲高前一根：MA7/MA25/MA99 最大最小相差
 SPIKE_MIN = 0.01            # 冲高K线的最高价，至少高出横盘上沿 1%（5分钟线；15分钟线可用 0.015）
 SPIKE_VOL_RATIO = 1.2       # 冲高K线成交量 >= 之前20根均量 * 该倍数（放量冲高）
 SPIKE_MAX_AGO = 6           # 冲高K线必须在最近 6 根以内
+EARLY_SIGNAL = False        # True：冲高K线一收盘就推（快，但冲高后马上回落时会先推突破、再推假突破，自相矛盾）；False：要等下一根确认
 NEAR_PEAK_TOL = 0.015       # 冲高高点与前高相差不超过 1.5%，标注"二次冲高到前高"（只标注，不强制）
 
 # --- 放量突破（偏多）---
@@ -108,6 +113,31 @@ FUNDING_BEFORE_MIN = 20         # 结算前 20 分钟开始避开
 FUNDING_AFTER_MIN = 10          # 结算后 10 分钟结束避开
 # OKX 资金费每 8 小时结算：北京时间 0 点、8 点、16 点
 
+# --- 只扫币安合约也有的币（OKX 独有的小币不扫）---
+REQUIRE_BINANCE = True
+BINANCE_FILE = "binance_perp_symbols.txt"   # 币安 USDT 永续币种缓存；GitHub Actions 取不到币安接口时用它
+BINANCE_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+FETCH_WORKERS = 3                           # 并发取K线的线程数（OKX 限频约 40 次/2 秒，别开太大）
+
+# --- 反弹受阻 / 回踩企稳（更快的入场信号）---
+BF_BOUNCE_BARS = 5          # 反弹窗口：触发K线之前的 5 根
+BF_DROP_CTX = 0.01          # 反弹前至少已经下跌 1%（做多镜像则是上涨 1%）
+BF_BOUNCE_MIN = 0.006       # 反弹幅度至少 0.6%（相对反弹前低点）
+BF_TOUCH_TOL = 0.004        # 反弹高点要碰到 MA7/MA25（相差 0.4% 以内）
+BF_NO_RECLAIM = 0.004       # 反弹期间收盘不能站上 MA25 超过 0.4%
+BF_MAX_BARS_AFTER_PEAK = 3  # 反弹高点之后 3 根内出现确认阴线才推（更快）
+BF_RISK_MAX = 0.025         # 止损距离（反弹高点上方）最大 2.5%
+BF_RISK_MIN = 0.002
+BF_MIN_RR = 0.0             # 到近期低点的盈亏比下限；0 = 不过滤（下跌延续时常常会跌破前低，所以不用前低卡盈亏比）
+
+# --- 大周期方向过滤（1小时）：只推和 1H 趋势同向的信号 ---
+USE_HTF_FILTER = True
+HTF_BAR = "1H"
+HTF_REQUIRE_ALIGN = True    # True：做多必须 1H 向上、做空必须 1H 向下；False：只拦截明显逆势的
+
+# --- 同一个币反方向信号冷却：刚推了做多，这段时间内不再推做空（反之亦然）---
+OPPOSITE_COOLDOWN_MIN = 90
+
 MAX_PUSH = 8                # 每种形态单次最多推多少个币
 STATE_FILE = "seen_pattern_ts.txt"
 # ==============================
@@ -141,7 +171,7 @@ def spike_candidates(klines):
         return
     o, h, l, c, v = _arrays(klines)
     i = n - 1
-    for s in range(i, max(i - SPIKE_MAX_AGO, BASE_WIN + 20) - 1, -1):   # s=i：冲高K线刚收盘就能发现，不用再等一根
+    for s in range(i if EARLY_SIGNAL else i - 1, max(i - SPIKE_MAX_AGO, BASE_WIN + 20) - 1, -1):
         b0 = s - BASE_WIN
         base_hi = max(h[b0:s])
         base_lo = min(l[b0:s])
@@ -330,7 +360,7 @@ def detect_trend_pullback(klines, side):
 
 FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
 # 每种形态的方向：long 做多 / short 做空
-SIDE = {"fake": "short", "breakout": "long", "restart": "long", "breakdown": "short", "weak_restart": "short", "trend_long": "long", "trend_short": "short"}
+SIDE = {"fake": "short", "breakout": "long", "restart": "long", "bounce_short": "short", "bounce_long": "long", "breakdown": "short", "weak_restart": "short", "trend_long": "long", "trend_short": "short"}
 
 
 def get_funding(inst_id):
@@ -403,6 +433,96 @@ def detect_weak_restart(klines):
     }
 
 
+def detect_bounce_fail_short(klines):
+    """做空：下跌中小幅反弹碰到 MA7/MA25 没站上，反弹高点后 1~3 根内出现确认阴线"""
+    n = len(klines)
+    if n < 130:
+        return None
+    o, h, l, c, v = _arrays(klines)
+    i = n - 1
+    m7, m25, m25_6 = ma(c, 7, i), ma(c, 25, i), ma(c, 25, i - 6)
+    if None in (m7, m25, m25_6):
+        return None
+
+    # 环境：价格在 MA25 下方，MA25 向下，MA7 不在 MA25 上方
+    if not (c[i] < m25 and m25 < m25_6 and m7 <= m25 * 1.001):
+        return None
+
+    # 反弹高点：触发K线之前 BF_BOUNCE_BARS 根里的最高点
+    w0 = i - BF_BOUNCE_BARS
+    j = max(range(w0, i), key=lambda x: h[x])
+    if not (1 <= i - j <= BF_MAX_BARS_AFTER_PEAK):
+        return None
+    peak = h[j]
+    m7j, m25j = ma(c, 7, j), ma(c, 25, j)
+    if peak < min(m7j, m25j) * (1 - BF_TOUCH_TOL) or peak > m25j * (1 + BF_NO_RECLAIM + 0.004):
+        return None
+    for k in range(w0, i):                      # 反弹期间没有收盘站上 MA25
+        if c[k] > ma(c, 25, k) * (1 + BF_NO_RECLAIM):
+            return None
+
+    # 反弹之前已经下跌，且反弹有一定幅度
+    pre_high = max(h[i - 30:w0])
+    pre_low = min(l[i - 12:j + 1])
+    if (pre_high - pre_low) / pre_high < BF_DROP_CTX:
+        return None
+    if (peak - pre_low) / pre_low < BF_BOUNCE_MIN:
+        return None
+
+    # 触发：确认阴线，收盘低于上一根收盘，并且跌破 MA7 或跌破上一根最低价
+    if not (c[i] < o[i] and c[i] < c[i - 1] and (c[i] < m7 or c[i] < l[i - 1])):
+        return None
+
+    stop = peak * 1.002
+    risk = (stop - c[i]) / c[i]
+    if not (BF_RISK_MIN <= risk <= BF_RISK_MAX):
+        return None
+    swing_low = min(l[i - 30:i])
+    rr = (c[i] - swing_low) / (stop - c[i])
+    if rr < BF_MIN_RR:
+        return None
+
+    return {
+        "key_ts": klines[j][0], "ts": klines[i][0], "side": "short",
+        "price": c[i], "stop": stop, "target1": swing_low, "target2": c[i] - 2 * (stop - c[i]),
+        "risk": risk, "rr": rr, "bounce": (peak - pre_low) / pre_low,
+        "ma25": m25, "ma7": m7, "bars_after": i - j,
+    }
+
+
+def detect_bounce_fail_long(klines):
+    """做多：detect_bounce_fail_short 的镜像（回踩到均线获得支撑，首根阳线确认）"""
+    r = detect_bounce_fail_short(invert_klines(klines))
+    if not r:
+        return None
+    price, stop, t1 = 1 / r["price"], 1 / r["stop"], 1 / r["target1"]
+    return {
+        "key_ts": r["key_ts"], "ts": r["ts"], "side": "long",
+        "price": price, "stop": stop, "target1": t1, "target2": price + 2 * (price - stop),
+        "risk": abs(price - stop) / price, "rr": r["rr"], "bounce": r["bounce"],
+        "ma25": 1 / r["ma25"], "ma7": 1 / r["ma7"], "bars_after": r["bars_after"],
+    }
+
+
+def htf_trend(inst_id):
+    """1 小时趋势：+1 向上（收盘在 MA25 上方且 MA25 上行），-1 向下，0 不明确；取不到返回 None"""
+    try:
+        ks = [k for k in get_klines(inst_id, HTF_BAR, 130) if k[8] == "1"]
+        c = [float(k[4]) for k in ks]
+        i = len(c) - 1
+        m25, m25_4 = ma(c, 25, i), ma(c, 25, i - 4)
+        if None in (m25, m25_4):
+            return None
+        if c[i] > m25 and m25 > m25_4:
+            return 1
+        if c[i] < m25 and m25 < m25_4:
+            return -1
+        return 0
+    except Exception as e:
+        print(f"{inst_id} 1H趋势获取失败: {e}", file=sys.stderr)
+        return None
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
@@ -419,6 +539,39 @@ def load_state():
 def save_state(d):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(f"{k}:{t}" for k, t in d.items()))
+
+
+def _norm_coin(base):
+    """币安的小币常带 1000/1000000 前缀（1000SHIB），OKX 没有，统一去掉再比较"""
+    b = base.upper()
+    for p_ in ("1000000", "100000", "10000", "1000"):
+        if b.startswith(p_) and len(b) > len(p_):
+            return b[len(p_):]
+    return b
+
+
+def load_binance_coins():
+    """币安 USDT 永续的币种集合。优先在线获取并写缓存；取不到就读缓存；都没有返回 None"""
+    try:
+        resp = requests.get(BINANCE_URL, timeout=(5, 10))
+        resp.raise_for_status()
+        bases = sorted({x["baseAsset"] for x in resp.json()["symbols"]
+                        if x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT"
+                        and x.get("status") == "TRADING"})
+        if len(bases) > 50:
+            with open(BINANCE_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(bases))
+            print(f"币安合约列表在线获取成功：{len(bases)} 个币")
+            return {_norm_coin(b) for b in bases}
+    except Exception as e:
+        print(f"币安合约列表在线获取失败（{e}），尝试读缓存", file=sys.stderr)
+    if os.path.exists(BINANCE_FILE):
+        with open(BINANCE_FILE, encoding="utf-8") as f:
+            bases = [x.strip() for x in f if x.strip()]
+        if bases:
+            print(f"使用缓存的币安合约列表：{len(bases)} 个币")
+            return {_norm_coin(b) for b in bases}
+    return None
 
 
 def list_candidates():
@@ -439,6 +592,14 @@ def list_candidates():
         if turnover >= MIN_TURNOVER_USDT:
             rows.append((inst, turnover))
     rows.sort(key=lambda x: x[1], reverse=True)
+    if REQUIRE_BINANCE:
+        bn_coins = load_binance_coins()
+        if bn_coins is None:
+            print("警告：拿不到币安合约列表，本轮不做'币安也有'过滤。请看说明上传 binance_perp_symbols.txt", file=sys.stderr)
+        else:
+            before = len(rows)
+            rows = [r for r in rows if _norm_coin(r[0].split("-")[0]) in bn_coins]
+            print(f"币安也有的币: {len(rows)}/{before}")
     return [r[0] for r in rows[:TOP_N]]
 
 
@@ -511,6 +672,17 @@ def fmt_weak_restart(sym, r):
     )
 
 
+def fmt_bounce(sym, r):
+    long_ = r["side"] == "long"
+    return (
+        f"{'📈 做多' if long_ else '📉 做空'} {sym.replace('-SWAP', '')} ({BAR}) {'回踩企稳' if long_ else '反弹受阻'}\n"
+        f"确认K线收盘: {format_candle_time(r['ts'])}（北京时间），距{'回踩低点' if long_ else '反弹高点'}已过 {r['bars_after']} 根\n"
+        f"参考入场价 {r['price']:.6g}，止损 {r['stop']:.6g}（距离 {r['risk']*100:.1f}%）\n"
+        f"目标1 {r['target1']:.6g}（近期{'高' if long_ else '低'}，盈亏比 {r['rr']:.1f}），目标2 {r['target2']:.6g}（2R）\n"
+        f"{'回踩' if long_ else '反弹'}幅度 {r['bounce']*100:.1f}%，MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g}"
+    )
+
+
 # 形态名 -> (检测函数, 推送格式, 钉钉标题)
 PATTERNS = {
     "fake": (detect_fake_breakout, fmt_fake, "合约形态提醒【偏空】均线粘合后冲高回落"),
@@ -518,6 +690,8 @@ PATTERNS = {
     "restart": (detect_pullback_restart, fmt_restart, "合约形态提醒【偏多】强势回调再启动"),
     "breakdown": (detect_breakdown, fmt_breakdown, "合约形态提醒【偏空】均线粘合后放量下破"),
     "weak_restart": (detect_weak_restart, fmt_weak_restart, "合约形态提醒【偏空】弱势反弹再下跌"),
+    "bounce_short": (detect_bounce_fail_short, fmt_bounce, "合约形态提醒【偏空】反弹受阻"),
+    "bounce_long": (detect_bounce_fail_long, fmt_bounce, "合约形态提醒【偏多】回踩企稳"),
     "trend_long": (lambda k: detect_trend_pullback(k, "long"), fmt_trend, "合约形态提醒【偏多】趋势回踩进场"),
     "trend_short": (lambda k: detect_trend_pullback(k, "short"), fmt_trend, "合约形态提醒【偏空】趋势回踩进场"),
 }
@@ -539,18 +713,24 @@ def main():
 
     hits = {name: [] for name in PATTERNS}
     t_start = time.time()
-    for idx, sym in enumerate(symbols, 1):
-        if idx == 1 or idx % 10 == 0:
-            print(f"进度 {idx}/{len(symbols)}  已用 {time.time() - t_start:.0f} 秒", flush=True)
+
+    def fetch_one(sym):
         try:
             ks = get_klines(sym, BAR, 150)
-            closed = [k for k in ks if k[8] == "1"]
+            return sym, [k for k in ks if k[8] == "1"]
         except Exception as e:
             print(f"{sym} 取K线失败: {e}", file=sys.stderr)
-            time.sleep(0.12)
-            continue
-        time.sleep(0.12)   # OKX K线接口限频，慢一点更稳
+            return sym, None
+        finally:
+            time.sleep(0.2)   # 每个线程每秒最多约 5 次，3 个线程约 15 次/秒，低于 OKX 限频
 
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+        fetched = list(ex.map(fetch_one, symbols))
+    print(f"K线获取完成，用时 {time.time() - t_start:.0f} 秒", flush=True)
+
+    for sym, closed in fetched:
+        if closed is None:
+            continue
         for name, (fn, _, _) in PATTERNS.items():
             try:
                 r = fn(closed)
@@ -583,6 +763,7 @@ def main():
             for n in hits:
                 hits[n] = [(sym, r) for sym, r in hits[n] if sym not in conflict]
 
+    now_ms = int(time.time() * 1000)
     for name, (_, fmt, title) in PATTERNS.items():
         items = hits[name]
         if not items:
@@ -597,6 +778,22 @@ def main():
         items.sort(key=lambda x: x[1]["ts"], reverse=True)
         parts = []
         for sym, r in items:
+            # 大周期方向过滤
+            trend = None
+            if USE_HTF_FILTER:
+                trend = htf_trend(sym)
+                time.sleep(0.1)
+                if trend is not None:
+                    want = 1 if side == "long" else -1
+                    if (HTF_REQUIRE_ALIGN and trend != want) or trend == -want:
+                        print(f"{sym} {name}: 1H趋势与{'做多' if side == 'long' else '做空'}不一致，跳过")
+                        continue
+            # 反方向冷却
+            opp = "short" if side == "long" else "long"
+            last_opp = state.get(f"{sym}|last_{opp}")
+            if last_opp and now_ms - int(last_opp) < OPPOSITE_COOLDOWN_MIN * 60 * 1000:
+                print(f"{sym} {name}: {OPPOSITE_COOLDOWN_MIN} 分钟内刚推过反方向信号，跳过")
+                continue
             fr = None
             if USE_FUNDING_FILTER:
                 fr = get_funding(sym)
@@ -605,13 +802,17 @@ def main():
                     print(f"{sym} {name}: 资金费率 {fr*100:+.3f}% 过于拥挤，跳过")
                     continue
             text = fmt(sym, r)
+            if trend is not None:
+                text += f"\n1H趋势 {'向上' if trend == 1 else '向下' if trend == -1 else '震荡'}"
             if fr is not None:
                 text += f"\n资金费率 {fr*100:+.3f}%"
             parts.append(text)
+            state[f"{sym}|last_{side}"] = str(now_ms)
             if len(parts) >= MAX_PUSH:
                 break
         if parts:
             push_to_dingtalk(title, "\n\n———\n\n".join(parts))
+    save_state(state)
 
 
 if __name__ == "__main__":
