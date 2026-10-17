@@ -18,6 +18,7 @@ OKX 永续合约 - 山寨币形态扫描（做空 / 做多 三种形态），命
 独立文件，不依赖 volume_alert.py，直接运行即可。
 """
 
+import json
 import os
 import sys
 import time
@@ -59,7 +60,7 @@ def push_to_dingtalk(title, content):
 
 # ========== 可调参数 ==========
 BAR = "5m"                  # 扫描周期：5m 更快（信号延迟小），15m 更稳；改了周期后阈值也要相应调
-TOP_N = 150                 # 只扫成交额前N的币（小盘币不扫）
+TOP_N = 100                 # 只扫成交额前100的币（小盘币不扫）
 MIN_TURNOVER_USDT = 20_000_000  # OKX 24h成交额下限（2000万U），小盘币不推；还嫌多就继续调大
 EXCLUDE = {"BTC", "ETH"}    # 不扫的币
 
@@ -68,7 +69,7 @@ BASE_RANGE_MAX = 0.03       # 横盘窗口内 最高-最低 不超过 3%（5分�
 MA_CONVERGE_MAX = 0.02      # 冲高前一根：MA7/MA25/MA99 最大最小相差不超过 2%（粘合）
 
 SPIKE_MIN = 0.01            # 冲高K线的最高价，至少高出横盘上沿 1%（5分钟线；15分钟线可用 0.015）
-SPIKE_VOL_RATIO = 1.2       # 冲高K线成交量 >= 之前20根均量 * 该倍数（放量冲高）
+SPIKE_VOL_RATIO = 3.0       # 冲高K线成交量 >= 之前20根均量的 3 倍（真放量才算，过滤掉普通波动）
 SPIKE_MAX_AGO = 6           # 冲高K线必须在最近 6 根以内
 EARLY_SIGNAL = False        # True：冲高K线一收盘就推（快，但冲高后马上回落时会先推突破、再推假突破，自相矛盾）；False：要等下一根确认
 NEAR_PEAK_TOL = 0.015       # 冲高高点与前高相差不超过 1.5%，标注"二次冲高到前高"（只标注，不强制）
@@ -97,7 +98,7 @@ RISK_MIN = 0.003            # 止损距离最小 0.3%
 RISK_MAX = 0.05             # 止损距离最大 5%（太远的不推）
 MIN_RR = 1.5                # 到前高/前低的盈亏比至少 1.5 才推
 
-TREND_TRIGGER_VOL_RATIO = 1.2   # 趋势回踩：触发K线成交量 >= 回踩期均量 * 该倍数（反转放量）
+TREND_TRIGGER_VOL_RATIO = 1.5   # 趋势回踩：触发K线成交量 >= 回踩期均量的 1.5 倍（反转要放量）
 
 # --- 市场/资金面过滤（推送前再筛一遍）---
 USE_FUNDING_FILTER = True
@@ -137,8 +138,9 @@ HTF_REQUIRE_ALIGN = True    # True：做多必须 1H 向上、做空必须 1H �
 
 # --- 同一个币反方向信号冷却：刚推了做多，这段时间内不再推做空（反之亦然）---
 OPPOSITE_COOLDOWN_MIN = 90
+SAME_SIDE_COOLDOWN_MIN = 60      # 同一个币同方向信号，60 分钟内只推一次（不同形态也算）
 
-MAX_PUSH = 8                # 每种形态单次最多推多少个币
+MAX_PUSH = 3                # 每种形态每轮最多推 3 个币，宁缺毋滥
 STATE_FILE = "seen_pattern_ts.txt"
 # ==============================
 
@@ -553,7 +555,7 @@ def _norm_coin(base):
 def load_binance_coins():
     """币安 USDT 永续的币种集合。优先在线获取并写缓存；取不到就读缓存；都没有返回 None"""
     try:
-        resp = requests.get(BINANCE_URL, timeout=(5, 10))
+        resp = requests.get(BINANCE_URL, timeout=(3, 8))
         resp.raise_for_status()
         bases = sorted({x["baseAsset"] for x in resp.json()["symbols"]
                         if x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT"
@@ -565,6 +567,21 @@ def load_binance_coins():
             return {_norm_coin(b) for b in bases}
     except Exception as e:
         print(f"币安合约列表在线获取失败（{e}），尝试读缓存", file=sys.stderr)
+    # 手动方案：在浏览器里打开 BINANCE_URL，另存为 binance_exchangeInfo.json 放在脚本旁边
+    if os.path.exists("binance_exchangeInfo.json"):
+        try:
+            with open("binance_exchangeInfo.json", encoding="utf-8") as f:
+                info = json.load(f)
+            bases = sorted({x["baseAsset"] for x in info["symbols"]
+                            if x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT"
+                            and x.get("status") == "TRADING"})
+            if len(bases) > 50:
+                with open(BINANCE_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(bases))
+                print(f"已从 binance_exchangeInfo.json 生成币安合约列表：{len(bases)} 个币")
+                return {_norm_coin(b) for b in bases}
+        except Exception as e:
+            print(f"读取 binance_exchangeInfo.json 失败: {e}", file=sys.stderr)
     if os.path.exists(BINANCE_FILE):
         with open(BINANCE_FILE, encoding="utf-8") as f:
             bases = [x.strip() for x in f if x.strip()]
@@ -697,6 +714,13 @@ PATTERNS = {
 }
 
 
+# 实盘要推送哪些形态：跑完 backtest_patterns.py 后，把表现差的形态从这里删掉
+# 默认只开 5 种：条件最严、出现最少、带止损/目标位的。
+# 关掉的 4 种：restart / weak_restart（刚站上/跌破 MA25 就推，质量参差）、bounce_short / bounce_long（出现太频繁，没验证过）。
+# 想打开，把名字加回这个集合即可。
+ENABLED_PATTERNS = {"fake", "breakout", "breakdown", "trend_long", "trend_short"}
+
+
 def main():
     if AVOID_FUNDING_WINDOW and in_funding_window():
         print("当前处在资金费结算前后的避开时段，本轮不扫描。")
@@ -732,6 +756,8 @@ def main():
         if closed is None:
             continue
         for name, (fn, _, _) in PATTERNS.items():
+            if name not in ENABLED_PATTERNS:
+                continue
             try:
                 r = fn(closed)
             except Exception as e:
@@ -790,6 +816,9 @@ def main():
                         continue
             # 反方向冷却
             opp = "short" if side == "long" else "long"
+            last_same = state.get(f"{sym}|last_{side}")
+            if last_same and now_ms - int(last_same) < SAME_SIDE_COOLDOWN_MIN * 60 * 1000:
+                continue
             last_opp = state.get(f"{sym}|last_{opp}")
             if last_opp and now_ms - int(last_opp) < OPPOSITE_COOLDOWN_MIN * 60 * 1000:
                 print(f"{sym} {name}: {OPPOSITE_COOLDOWN_MIN} 分钟内刚推过反方向信号，跳过")
