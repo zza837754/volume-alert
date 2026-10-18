@@ -4,12 +4,14 @@ OKX 永续合约 涨幅榜 / 跌幅榜 监控
 
 每次运行：
   1) 取全部 USDT 永续的 24 小时涨跌幅，排出涨幅榜前 30、跌幅榜前 30
-  2) 对榜内的币逐条检查"要求"（见下面参数），全部满足才推送到钉钉：
-       - 24 小时涨幅 >= MIN_CHANGE_24H（跌幅榜则是跌幅）
-       - 近 1 小时仍朝同一方向走，幅度 >= MIN_MOVE_1H（说明还在动，不是早就走完）
-       - 近 1 小时成交额 >= 平均每小时成交额的 MIN_VOL_BOOST 倍（放量）
-       - 可选：必须是"新进榜"（REQUIRE_NEW_ENTRY = True）
-  3) 同一个币同一方向 COOLDOWN_MIN 分钟内只推一次
+  2) 满足下面任意一条就推送到钉钉：
+       A. 新进榜：这一轮在前 30，上一轮不在
+       B. 排名飙升：和大约 1 小时前相比，排名上升 >= RANK_RISE_MIN 名（1 小时前不在前 30 的按第 31 名算）
+  3) 同一个币同一方向 COOLDOWN_MIN 分钟内只推一次（避免在第 30 名附近进进出出反复推）
+
+说明：
+  - 脚本每轮会把榜单快照存进 rank_state.json，排名变化靠它来算。
+  - 第一次运行没有"上一轮"，不会推送；运行满约 45 分钟后，"排名飙升"才开始生效。
 
 独立文件，不依赖其他脚本。环境变量 DINGTALK_WEBHOOK 不设置时只打印不推送。
 """
@@ -28,10 +30,16 @@ TOP_N_RANK = 30                 # 看榜单前多少名
 MIN_TURNOVER_USDT = 20_000_000  # 24h成交额下限（2000万U），小盘币不进榜单
 EXCLUDE = {"BTC", "ETH"}        # 不参与榜单的币
 
-MIN_CHANGE_24H = 0.08           # 24小时涨/跌幅至少 8%
-MIN_MOVE_1H = 0.015             # 近1小时同方向至少 1.5%
-MIN_VOL_BOOST = 2.0             # 近1小时成交额 >= 日均每小时成交额的 2 倍
-REQUIRE_NEW_ENTRY = False       # True：只推"这一轮刚进榜"的币；False：在榜内且满足要求就推
+MIN_CHANGE_24H = 0.03           # 兜底：24小时涨/跌幅至少 3% 才算（避免行情平静时前30名都只有零点几个点）；设 0 就是完全不限制
+RANK_RISE_MIN = 10              # 排名飙升：和约1小时前相比，上升至少 10 名
+HIST_MIN_AGE = 45               # 用来比较的"1小时前"快照，至少要多旧（分钟）
+HIST_MAX_AGE = 90               # 快照最多保留多久（分钟）
+PREV_MAX_AGE = 30               # "上一轮"快照超过这么久就不算（比如中途停跑过），避免误判新进榜
+
+# 下面三项只用来在消息里显示"动量"，默认不作为推送条件；想当条件就把 REQUIRE_MOMENTUM 改成 True
+REQUIRE_MOMENTUM = False
+MIN_MOVE_1H = 0.015             # REQUIRE_MOMENTUM=True 时：近1小时同方向至少 1.5%
+MIN_VOL_BOOST = 2.0             # REQUIRE_MOMENTUM=True 时：近1小时成交额 >= 日均每小时的 2 倍
 
 COOLDOWN_MIN = 120              # 同一个币同一方向，多少分钟内不重复推
 MAX_PUSH = 5                    # 涨幅榜、跌幅榜每轮各最多推几个
@@ -127,7 +135,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"prev_up": None, "prev_down": None, "last_alert": {}}
+    return {"hist_up": [], "hist_down": [], "last_alert": {}}
 
 
 def save_state(state):
@@ -179,43 +187,49 @@ def build_rankings():
     return up, down
 
 
-def check_momentum(item, direction):
-    """近1小时走势检查，满足返回 (1小时涨跌幅, 放量倍数)，不满足或取不到返回 None"""
+def get_momentum(item):
+    """近1小时走势：返回 (1小时涨跌幅, 放量倍数)，取不到返回 None"""
     per_hour = max(1, 60 // {"1m": 1, "3m": 3, "5m": 5, "15m": 15}.get(BAR, 5))
     ks = [k for k in get_klines(item["inst"], BAR, per_hour + 5) if k[8] == "1"]
     if len(ks) < per_hour + 1:
         return None
     closes = [float(k[4]) for k in ks]
     move = closes[-1] / closes[-1 - per_hour] - 1
-    if direction == "up" and move < MIN_MOVE_1H:
-        return None
-    if direction == "down" and move > -MIN_MOVE_1H:
-        return None
     recent = ks[-per_hour:]
     quote = sum(float(k[7]) if float(k[7]) > 0 else float(k[6]) * float(k[4]) for k in recent)
     avg_hour = item["turnover"] / 24
-    boost = quote / avg_hour if avg_hour > 0 else 0
-    if boost < MIN_VOL_BOOST:
-        return None
-    return move, boost
+    return move, (quote / avg_hour if avg_hour > 0 else 0)
 
 
-def fmt_item(item, direction, move, boost, is_new, funding):
+def fmt_item(item, direction, tags, rank_line, mom, funding):
     up = direction == "up"
     lines = [
-        f"{'📈 涨幅榜' if up else '📉 跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}"
-        + ("  🆕新进榜" if is_new else ""),
-        f"24h {item['chg']*100:+.1f}%，现价 {item['last']:.6g}",
-        f"近1小时 {move*100:+.1f}%，近1小时成交额是日均每小时的 {boost:.1f} 倍",
-        f"24h成交额 {item['turnover']/1e6:.0f}M USDT",
+        f"{'📈 涨幅榜' if up else '📉 跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}  {' '.join(tags)}",
+        rank_line,
+        f"24h {item['chg']*100:+.1f}%，现价 {item['last']:.6g}，24h成交额 {item['turnover']/1e6:.0f}M USDT",
     ]
+    if mom:
+        lines.append(f"近1小时 {mom[0]*100:+.1f}%，近1小时成交额是日均每小时的 {mom[1]:.1f} 倍")
     if funding is not None:
         lines.append(f"资金费率 {funding*100:+.3f}%")
     return "\n".join(lines)
 
 
+def _pick(hist, now_ms, lo_min, hi_min, target_min=60):
+    """从快照列表里挑一个年龄在 [lo_min, hi_min] 分钟内、最接近 target_min 的；没有返回 None"""
+    best, best_gap = None, None
+    for ts, ranks in hist:
+        age = (now_ms - ts) / 60000
+        if lo_min <= age <= hi_min:
+            gap = abs(age - target_min)
+            if best is None or gap < best_gap:
+                best, best_gap = ranks, gap
+    return best
+
+
 def main():
     state = load_state()
+    state.setdefault("last_alert", {})
     now_ms = int(time.time() * 1000)
 
     up, down = build_rankings()
@@ -225,45 +239,73 @@ def main():
     if down:
         print("跌幅榜前5: " + "，".join(f"{r['inst'].split('-')[0]} {r['chg']*100:+.1f}%" for r in down[:5]))
 
-    for direction, board, prev_key, title in (
-        ("up", up, "prev_up", "合约涨幅榜提醒"),
-        ("down", down, "prev_down", "合约跌幅榜提醒"),
+    for direction, board, hist_key, title in (
+        ("up", up, "hist_up", "合约涨幅榜提醒"),
+        ("down", down, "hist_down", "合约跌幅榜提醒"),
     ):
-        prev = state.get(prev_key)                       # 上一轮榜单；第一次运行为 None，不算"新进榜"
-        prev_set = set(prev) if prev is not None else None
+        hist = [(int(ts), ranks) for ts, ranks in state.get(hist_key, [])]
+        prev = _pick(hist, now_ms, 0, PREV_MAX_AGE, target_min=0)       # 最近一轮
+        hour_ago = _pick(hist, now_ms, HIST_MIN_AGE, HIST_MAX_AGE)        # 约 1 小时前
+
         parts = []
         for item in board:
             if len(parts) >= MAX_PUSH:
                 break
             if abs(item["chg"]) < MIN_CHANGE_24H:
                 continue
-            is_new = prev_set is not None and item["inst"] not in prev_set
-            if REQUIRE_NEW_ENTRY and not is_new:
+            inst = item["inst"]
+            tags, rank_line = [], ""
+            is_new = prev is not None and inst not in prev
+            if is_new:
+                tags.append("🆕新进榜")
+                rank_line = f"排名 #{item['rank']}（上一轮不在前{TOP_N_RANK}）"
+            if hour_ago is not None:
+                old_rank = hour_ago.get(inst, TOP_N_RANK + 1)
+                rise = old_rank - item["rank"]
+                if rise >= RANK_RISE_MIN:
+                    tags.append(f"⚡排名飙升 +{rise}")
+                    old_txt = f"#{old_rank}" if inst in hour_ago else f"前{TOP_N_RANK}之外"
+                    rank_line = f"排名 #{item['rank']}（约1小时前 {old_txt}，上升 {rise} 名）"
+            if not tags:
                 continue
-            key = f"{item['inst']}|{direction}"
+
+            key = f"{inst}|{direction}"
             last = state["last_alert"].get(key)
             if last and now_ms - int(last) < COOLDOWN_MIN * 60 * 1000:
                 continue
+
+            mom = None
             try:
-                m = check_momentum(item, direction)
+                mom = get_momentum(item)
             except Exception as e:
-                print(f"{item['inst']} 取K线失败: {e}", file=sys.stderr)
-                m = None
+                print(f"{inst} 取K线失败: {e}", file=sys.stderr)
             time.sleep(0.15)
-            if not m:
-                continue
-            funding = get_funding(item["inst"])
+            if REQUIRE_MOMENTUM:
+                if not mom:
+                    continue
+                dir_ok = mom[0] >= MIN_MOVE_1H if direction == "up" else mom[0] <= -MIN_MOVE_1H
+                if not (dir_ok and mom[1] >= MIN_VOL_BOOST):
+                    continue
+
+            funding = get_funding(inst)
             time.sleep(0.1)
-            parts.append(fmt_item(item, direction, m[0], m[1], is_new, funding))
+            parts.append(fmt_item(item, direction, tags, rank_line, mom, funding))
             state["last_alert"][key] = str(now_ms)
-        state[prev_key] = [r["inst"] for r in board]
+
+        # 记录本轮快照，只保留最近 HIST_MAX_AGE 分钟
+        hist.append((now_ms, {r["inst"]: r["rank"] for r in board}))
+        hist = [(ts, ranks) for ts, ranks in hist if (now_ms - ts) / 60000 <= HIST_MAX_AGE]
+        state[hist_key] = [[ts, ranks] for ts, ranks in hist]
+
         if parts:
             push_to_dingtalk(title, "\n\n———\n\n".join(parts))
         else:
-            print(f"{'涨幅榜' if direction == 'up' else '跌幅榜'}：本轮没有达到要求的币")
+            print(f"{'涨幅榜' if direction == 'up' else '跌幅榜'}：本轮没有新进榜或排名飙升的币")
 
     # 清理超过 1 天的冷却记录，文件不会越来越大
     state["last_alert"] = {k: v for k, v in state["last_alert"].items() if now_ms - int(v) < 24 * 3600 * 1000}
+    state.pop("prev_up", None)
+    state.pop("prev_down", None)
     save_state(state)
 
 
