@@ -17,6 +17,7 @@
          - run: python rank_monitor.py
            env:
              DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+             DINGTALK_WEBHOOK_RANK: ${{ secrets.DINGTALK_WEBHOOK_RANK }}
          - run: |
              git config user.name "bot"
              git config user.email "bot@users.noreply.github.com"
