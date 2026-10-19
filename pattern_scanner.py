@@ -47,9 +47,10 @@ def get_klines(symbol, interval, limit):
 
 
 def push_to_dingtalk(title, content):
-    webhook = os.environ.get("DINGTALK_WEBHOOK")
+    # 优先用本脚本专用的群（DINGTALK_WEBHOOK_PATTERN），没设置就用默认群（DINGTALK_WEBHOOK）
+    webhook = os.environ.get("DINGTALK_WEBHOOK_PATTERN") or os.environ.get("DINGTALK_WEBHOOK")
     if not webhook:
-        print("未设置 DINGTALK_WEBHOOK，仅打印：")
+        print("未设置 DINGTALK_WEBHOOK_PATTERN / DINGTALK_WEBHOOK，仅打印：")
         print(title)
         print(content)
         return
@@ -84,9 +85,12 @@ PEAK_SEARCH = 90            # 往回找峰值的范围（根）
 PEAK_MIN_AGO = 6            # 峰值至少在 6 根之前（说明确实回调了一段）
 RETRACE_MIN = 0.20          # 回调幅度占整波拉升的比例：至少 20%
 RETRACE_MAX = 0.75          # 最多 75%（回调太深就算走坏）
-RESTART_CROSS_BARS = 3      # 最近 3 根内重新站上 MA25
-RESTART_VOL_RATIO = 1.3     # 站上时最近 3 根里最大成交量 >= 之前20根均量 * 该倍数（放量确认）
-RESTART_MA7_TOL = 0.003     # MA7 至少要接近或已上穿 MA25（MA7 不能比 MA25 低超过 0.3%）
+RESTART_CROSS_BARS = 4      # 最近 4 根内重新站上 MA25
+RESTART_VOL_RATIO = 1.0     # 站上时最近几根里最大成交量 >= 回调整理期（再往前8根）均量 * 该倍数（比整理期放量就行）
+RESTART_VOL_BASE_BARS = 8
+RESTART_MA7_TOL = 0.02      # MA7 不能比 MA25 低超过 2%（MA7 正在往上追 MA25 的阶段也算）
+RESTART_MAX_EXT = 0.06      # 追高过滤：现价离 MA25 超过 6% 就不推（已经拉出去太远）
+PUMP_BASE_BARS = 60         # 拉升起点：峰值之前多少根里的最低价（15分钟线 60 根 = 15 小时）
 
 # --- 趋势回踩进场（顺势，做多/做空）---
 TOUCH_TOL = 0.005           # 回踩时影线触及 MA25 附近（相差 0.5% 以内）
@@ -141,6 +145,9 @@ OPPOSITE_COOLDOWN_MIN = 90
 SAME_SIDE_COOLDOWN_MIN = 60      # 同一个币同方向信号，60 分钟内只推一次（不同形态也算）
 
 MAX_PUSH = 3                # 每种形态每轮最多推 3 个币，宁缺毋滥
+
+# 个别形态用别的周期看（其余形态用上面的 BAR）。强势回调再启动的拉升/回调动辄十几个小时，用 15 分钟线才看得全
+PATTERN_BAR = {"restart": "15m", "weak_restart": "15m"}
 STATE_FILE = "seen_pattern_ts.txt"
 # ==============================
 
@@ -240,7 +247,7 @@ def detect_pullback_restart(klines):
     lo_idx = max(0, i - PEAK_SEARCH)
     pk = max(range(lo_idx, i - PEAK_MIN_AGO + 1), key=lambda x: h[x])
     peak = h[pk]
-    base = min(l[max(0, pk - 30):pk + 1])
+    base = min(l[max(0, pk - PUMP_BASE_BARS):pk + 1])
     if base <= 0 or (peak - base) / base < PUMP_UP_MIN:
         return None
 
@@ -269,9 +276,11 @@ def detect_pullback_restart(klines):
     if cross is None:
         return None
 
-    prev_vol = sum(v[i - RESTART_CROSS_BARS - 20 + 1:i - RESTART_CROSS_BARS + 1]) / 20
+    prev_vol = sum(v[i - RESTART_CROSS_BARS - RESTART_VOL_BASE_BARS + 1:i - RESTART_CROSS_BARS + 1]) / RESTART_VOL_BASE_BARS
     recent_vol = max(v[i - RESTART_CROSS_BARS + 1:i + 1])
     if prev_vol <= 0 or recent_vol < prev_vol * RESTART_VOL_RATIO:
+        return None
+    if (c[i] - m25) / m25 > RESTART_MAX_EXT:      # 离 MA25 太远，别追
         return None
 
     return {
@@ -650,7 +659,7 @@ def fmt_breakout(sym, r):
 def fmt_restart(sym, r):
     tag = "已创新高" if r["new_high"] else "回调后再启动"
     return (
-        f"📈 做多 {sym.replace('-SWAP', '')} ({BAR}) 强势回调再启动 [{tag}]\n"
+        f"📈 做多 {sym.replace('-SWAP', '')} ({r.get('bar', BAR)}) 强势回调再启动 [{tag}]\n"
         f"站上MA25: {format_candle_time(r['key_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
         f"前一波拉升 +{r['pump_pct']*100:.0f}%（高点 {r['peak']}），回调了 {r['retrace']*100:.0f}%，现价 {r['price']}\n"
         f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
@@ -682,7 +691,7 @@ def fmt_breakdown(sym, r):
 def fmt_weak_restart(sym, r):
     tag = "已创新低" if r["new_low"] else "反弹后再下跌"
     return (
-        f"📉 做空 {sym.replace('-SWAP', '')} ({BAR}) 弱势反弹再下跌 [{tag}]\n"
+        f"📉 做空 {sym.replace('-SWAP', '')} ({r.get('bar', BAR)}) 弱势反弹再下跌 [{tag}]\n"
         f"跌破MA25: {format_candle_time(r['key_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
         f"前一波下跌约 -{r['drop_pct']*100:.0f}%（低点 {r['trough']:.6g}），反弹了 {r['retrace']*100:.0f}%，现价 {r['price']}\n"
         f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
@@ -716,9 +725,9 @@ PATTERNS = {
 
 # 实盘要推送哪些形态：跑完 backtest_patterns.py 后，把表现差的形态从这里删掉
 # 默认只开 5 种：条件最严、出现最少、带止损/目标位的。
-# 关掉的 4 种：restart / weak_restart（刚站上/跌破 MA25 就推，质量参差）、bounce_short / bounce_long（出现太频繁，没验证过）。
+# 关掉的 3 种：weak_restart、bounce_short / bounce_long（后两种出现太频繁，没验证过）。restart（强势回调再启动，用 15 分钟线看）已按 ARIA 那张图放宽后重新打开。
 # 想打开，把名字加回这个集合即可。
-ENABLED_PATTERNS = {"fake", "breakout", "breakdown", "trend_long", "trend_short"}
+ENABLED_PATTERNS = {"fake", "breakout", "breakdown", "trend_long", "trend_short"}   # restart 已搬到 rank_monitor.py（只在涨跌幅榜里找）；想在全部币里找，把 "restart" 加回来
 
 
 def main():
@@ -738,25 +747,31 @@ def main():
     hits = {name: [] for name in PATTERNS}
     t_start = time.time()
 
-    def fetch_one(sym):
+    need_bars = sorted({PATTERN_BAR.get(n, BAR) for n in ENABLED_PATTERNS})
+
+    def fetch_closed(sym, bar):
         try:
-            ks = get_klines(sym, BAR, 150)
+            ks = get_klines(sym, bar, 150)
             return sym, [k for k in ks if k[8] == "1"]
         except Exception as e:
-            print(f"{sym} 取K线失败: {e}", file=sys.stderr)
+            print(f"{sym} 取{bar}K线失败: {e}", file=sys.stderr)
             return sym, None
         finally:
             time.sleep(0.2)   # 每个线程每秒最多约 5 次，3 个线程约 15 次/秒，低于 OKX 限频
 
-    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-        fetched = list(ex.map(fetch_one, symbols))
-    print(f"K线获取完成，用时 {time.time() - t_start:.0f} 秒", flush=True)
+    data = {}
+    for bar_ in need_bars:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            data[bar_] = dict(ex.map(lambda sy: fetch_closed(sy, bar_), symbols))
+    print(f"K线获取完成（{'、'.join(need_bars)}），用时 {time.time() - t_start:.0f} 秒", flush=True)
 
-    for sym, closed in fetched:
-        if closed is None:
-            continue
+    for sym in symbols:
         for name, (fn, _, _) in PATTERNS.items():
             if name not in ENABLED_PATTERNS:
+                continue
+            bar_ = PATTERN_BAR.get(name, BAR)
+            closed = data.get(bar_, {}).get(sym)
+            if closed is None:
                 continue
             try:
                 r = fn(closed)
@@ -765,6 +780,7 @@ def main():
                 continue
             if not r:
                 continue
+            r["bar"] = bar_
             key = f"{sym}|{name}"
             last = state.get(key)
             if last and int(r["key_ts"]) <= int(last):   # 同一次信号只推一次
