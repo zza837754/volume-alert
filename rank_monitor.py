@@ -4,16 +4,19 @@ OKX 永续合约 涨幅榜 / 跌幅榜 监控
 
 每次运行：
   1) 取全部 USDT 永续的 24 小时涨跌幅，排出涨幅榜前 30、跌幅榜前 30
-  2) 满足下面任意一条就推送到钉钉：
+  2) 榜内的币满足下面任意一条就推送到钉钉：
        A. 新进榜：这一轮在前 30，上一轮不在
-       B. 排名飙升：和大约 1 小时前相比，排名上升 >= RANK_RISE_MIN 名（1 小时前不在前 30 的按第 31 名算）
-  3) 同一个币同一方向 COOLDOWN_MIN 分钟内只推一次（避免在第 30 名附近进进出出反复推）
+       B. 排名飙升：和大约 1 小时前相比，排名上升 >= RANK_RISE_MIN 名
+       C. 回调再启动形态（15 分钟线）：
+            涨幅榜：前面一波拉升 → 回调 → 重新站上 MA25 和 MA7（ARIA 那种走势）
+            跌幅榜：镜像，前面一波暴跌 → 反弹 → 重新跌破 MA25 和 MA7
+  3) A/B 同一个币同一方向 COOLDOWN_MIN 分钟内只推一次；C 同一次形态只推一次
 
 说明：
   - 脚本每轮会把榜单快照存进 rank_state.json，排名变化靠它来算。
-  - 第一次运行没有"上一轮"，不会推送；运行满约 45 分钟后，"排名飙升"才开始生效。
+  - 第一次运行没有"上一轮"，A 不会触发；B 要累计约 45 分钟快照后才生效；C 第一次运行就可能触发。
 
-独立文件，不依赖其他脚本。环境变量 DINGTALK_WEBHOOK 不设置时只打印不推送。
+独立文件，不依赖其他脚本。环境变量 DINGTALK_WEBHOOK_RANK（或 DINGTALK_WEBHOOK）不设置时只打印不推送。
 """
 
 import datetime
@@ -35,6 +38,24 @@ RANK_RISE_MIN = 10              # 排名飙升：和约1小时前相比，上升
 HIST_MIN_AGE = 45               # 用来比较的"1小时前"快照，至少要多旧（分钟）
 HIST_MAX_AGE = 90               # 快照最多保留多久（分钟）
 PREV_MAX_AGE = 30               # "上一轮"快照超过这么久就不算（比如中途停跑过），避免误判新进榜
+
+# --- 触发开关 ---
+ENABLE_RANK_TRIGGERS = True     # A/B：新进榜、排名飙升
+ENABLE_SHAPE_TRIGGER = True     # C：回调再启动形态
+
+# --- C：回调再启动形态（15 分钟线）的参数，含义和 pattern_scanner.py 里一致 ---
+SHAPE_BAR = "15m"
+PUMP_UP_MIN = 0.15              # 前面那波拉升（或暴跌）幅度至少 15%
+PUMP_BASE_BARS = 60             # 拉升起点：峰值之前 60 根里的最低价
+PEAK_SEARCH = 90                # 往回找峰值的范围（根）
+PEAK_MIN_AGO = 6                # 峰值至少在 6 根之前
+RETRACE_MIN = 0.20              # 回调幅度占整波的比例：20%～75%
+RETRACE_MAX = 0.75
+RESTART_CROSS_BARS = 4          # 最近 4 根内重新站上 MA25
+RESTART_VOL_BASE_BARS = 8       # 成交量对比：回调整理期（再往前 8 根）
+RESTART_VOL_RATIO = 1.0         # 站上时的成交量 >= 整理期均量 * 该倍数
+RESTART_MA7_TOL = 0.02          # MA7 不能比 MA25 低超过 2%
+RESTART_MAX_EXT = 0.06          # 现价离 MA25 超过 6% 不推（别追）
 
 # 下面三项只用来在消息里显示"动量"，默认不作为推送条件；想当条件就把 REQUIRE_MOMENTUM 改成 True
 REQUIRE_MOMENTUM = False
@@ -58,9 +79,10 @@ FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
 
 # ---------- 基础工具 ----------
 def push_to_dingtalk(title, content):
-    webhook = os.environ.get("DINGTALK_WEBHOOK")
+    # 优先用本脚本专用的群（DINGTALK_WEBHOOK_RANK），没设置就用默认群（DINGTALK_WEBHOOK）
+    webhook = os.environ.get("DINGTALK_WEBHOOK_RANK") or os.environ.get("DINGTALK_WEBHOOK")
     if not webhook:
-        print("未设置 DINGTALK_WEBHOOK，仅打印：")
+        print("未设置 DINGTALK_WEBHOOK_RANK / DINGTALK_WEBHOOK，仅打印：")
         print(title)
         print(content)
         return
@@ -135,7 +157,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"hist_up": [], "hist_down": [], "last_alert": {}}
+    return {"hist_up": [], "hist_down": [], "last_alert": {}, "shape_seen": {}}
 
 
 def save_state(state):
@@ -201,13 +223,107 @@ def get_momentum(item):
     return move, (quote / avg_hour if avg_hour > 0 else 0)
 
 
-def fmt_item(item, direction, tags, rank_line, mom, funding):
+# ---------- C：回调再启动形态 ----------
+def ma(values, n, end):
+    if end + 1 < n:
+        return None
+    return sum(values[end - n + 1:end + 1]) / n
+
+
+def _invert(klines):
+    """价格取倒数（O,H,L,C -> 1/O,1/L,1/H,1/C），用来把"暴跌后反弹"当成"拉升后回调"的镜像来检测"""
+    return [[k[0], 1 / float(k[1]), 1 / float(k[3]), 1 / float(k[2]), 1 / float(k[4]), k[5], k[6], k[7], k[8]]
+            for k in klines]
+
+
+def _restart_up(klines):
+    """拉升 -> 回调 -> 重新站上 MA25 和 MA7。命中返回 dict，否则 None"""
+    n = len(klines)
+    if n < 130:
+        return None
+    h = [float(k[2]) for k in klines]
+    l = [float(k[3]) for k in klines]
+    c = [float(k[4]) for k in klines]
+    v = [float(k[6]) for k in klines]
+    i = n - 1
+
+    pk = max(range(max(0, i - PEAK_SEARCH), i - PEAK_MIN_AGO + 1), key=lambda x: h[x])
+    peak = h[pk]
+    base = min(l[max(0, pk - PUMP_BASE_BARS):pk + 1])
+    if base <= 0 or (peak - base) / base < PUMP_UP_MIN:
+        return None
+    pull_low = min(l[pk:i + 1])
+    retrace = (peak - pull_low) / (peak - base)
+    if not (RETRACE_MIN <= retrace <= RETRACE_MAX):
+        return None
+
+    m7, m7_prev, m25, m99 = ma(c, 7, i), ma(c, 7, i - 3), ma(c, 25, i), ma(c, 99, i)
+    if None in (m7, m7_prev, m25, m99):
+        return None
+    if not (c[i] > m25 and c[i] > m7 and m7 > m7_prev and c[i] > m99):
+        return None
+    if m7 < m25 * (1 - RESTART_MA7_TOL):
+        return None
+    if (c[i] - m25) / m25 > RESTART_MAX_EXT:
+        return None
+
+    low_idx = l.index(pull_low, pk)
+    cross = None
+    for j in range(i, i - RESTART_CROSS_BARS, -1):
+        if j > low_idx and c[j - 1] <= ma(c, 25, j - 1) and c[j] > ma(c, 25, j):
+            cross = j
+            break
+    if cross is None:
+        return None
+
+    prev_vol = sum(v[i - RESTART_CROSS_BARS - RESTART_VOL_BASE_BARS + 1:i - RESTART_CROSS_BARS + 1]) / RESTART_VOL_BASE_BARS
+    recent_vol = max(v[i - RESTART_CROSS_BARS + 1:i + 1])
+    if prev_vol <= 0 or recent_vol < prev_vol * RESTART_VOL_RATIO:
+        return None
+
+    return {"key_ts": klines[cross][0], "peak": peak, "pump_pct": (peak - base) / base, "retrace": retrace,
+            "new_extreme": max(h[i - RESTART_CROSS_BARS + 1:i + 1]) >= peak, "bars_after": i - cross}
+
+
+def detect_shape(klines, direction):
+    """direction='up' 找拉升后回调再启动；'down' 找暴跌后反弹再下跌（镜像）。返回消息里要用的字段"""
+    c = [float(k[4]) for k in klines]
+    i = len(c) - 1
+    if direction == "up":
+        r = _restart_up(klines)
+        if not r:
+            return None
+        return {"key_ts": r["key_ts"], "extreme": r["peak"], "move_pct": r["pump_pct"], "retrace": r["retrace"],
+                "new_extreme": r["new_extreme"], "bars_after": r["bars_after"],
+                "ma7": ma(c, 7, i), "ma25": ma(c, 25, i), "ma99": ma(c, 99, i)}
+    r = _restart_up(_invert(klines))
+    if not r:
+        return None
+    return {"key_ts": r["key_ts"], "extreme": 1 / r["peak"], "move_pct": r["pump_pct"] / (1 + r["pump_pct"]),
+            "retrace": r["retrace"], "new_extreme": r["new_extreme"], "bars_after": r["bars_after"],
+            "ma7": ma(c, 7, i), "ma25": ma(c, 25, i), "ma99": ma(c, 99, i)}
+
+
+def fmt_shape(direction, sh):
+    up = direction == "up"
+    return (
+        f"形态（{SHAPE_BAR}）：{'强势回调再启动' if up else '弱势反弹再下跌'}"
+        f"{'，已创新高' if up and sh['new_extreme'] else '，已创新低' if (not up) and sh['new_extreme'] else ''}\n"
+        f"前一波{'拉升 +' if up else '下跌 -'}{sh['move_pct']*100:.0f}%（{'高' if up else '低'}点 {sh['extreme']:.6g}），"
+        f"{'回调' if up else '反弹'}了 {sh['retrace']*100:.0f}%，{'站上' if up else '跌破'}MA25 已过 {sh['bars_after']} 根\n"
+        f"MA7 {sh['ma7']:.6g} / MA25 {sh['ma25']:.6g} / MA99 {sh['ma99']:.6g}"
+    )
+
+
+def fmt_item(item, direction, tags, rank_line, mom, funding, shape_text=""):
     up = direction == "up"
     lines = [
         f"{'📈 涨幅榜' if up else '📉 跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}  {' '.join(tags)}",
-        rank_line,
+        *([rank_line] if rank_line else []),
         f"24h {item['chg']*100:+.1f}%，现价 {item['last']:.6g}，24h成交额 {item['turnover']/1e6:.0f}M USDT",
     ]
+    if shape_text:
+        lines.append(shape_text)
     if mom:
         lines.append(f"近1小时 {mom[0]*100:+.1f}%，近1小时成交额是日均每小时的 {mom[1]:.1f} 倍")
     if funding is not None:
@@ -230,6 +346,7 @@ def _pick(hist, now_ms, lo_min, hi_min, target_min=60):
 def main():
     state = load_state()
     state.setdefault("last_alert", {})
+    state.setdefault("shape_seen", {})
     now_ms = int(time.time() * 1000)
 
     up, down = build_rankings()
@@ -254,24 +371,49 @@ def main():
             if abs(item["chg"]) < MIN_CHANGE_24H:
                 continue
             inst = item["inst"]
-            tags, rank_line = [], ""
-            is_new = prev is not None and inst not in prev
-            if is_new:
-                tags.append("🆕新进榜")
-                rank_line = f"排名 #{item['rank']}（上一轮不在前{TOP_N_RANK}）"
-            if hour_ago is not None:
-                old_rank = hour_ago.get(inst, TOP_N_RANK + 1)
-                rise = old_rank - item["rank"]
-                if rise >= RANK_RISE_MIN:
-                    tags.append(f"⚡排名飙升 +{rise}")
-                    old_txt = f"#{old_rank}" if inst in hour_ago else f"前{TOP_N_RANK}之外"
-                    rank_line = f"排名 #{item['rank']}（约1小时前 {old_txt}，上升 {rise} 名）"
-            if not tags:
-                continue
+            tags, rank_line, shape_text = [], "", ""
 
-            key = f"{inst}|{direction}"
-            last = state["last_alert"].get(key)
-            if last and now_ms - int(last) < COOLDOWN_MIN * 60 * 1000:
+            # A/B：新进榜、排名飙升（受冷却限制）
+            if ENABLE_RANK_TRIGGERS:
+                is_new = prev is not None and inst not in prev
+                rank_tags, rank_txt = [], ""
+                if is_new:
+                    rank_tags.append("🆕新进榜")
+                    rank_txt = f"排名 #{item['rank']}（上一轮不在前{TOP_N_RANK}）"
+                if hour_ago is not None:
+                    old_rank = hour_ago.get(inst, TOP_N_RANK + 1)
+                    rise = old_rank - item["rank"]
+                    if rise >= RANK_RISE_MIN:
+                        rank_tags.append(f"⚡排名飙升 +{rise}")
+                        old_txt = f"#{old_rank}" if inst in hour_ago else f"前{TOP_N_RANK}之外"
+                        rank_txt = f"排名 #{item['rank']}（约1小时前 {old_txt}，上升 {rise} 名）"
+                last = state["last_alert"].get(f"{inst}|{direction}")
+                cooling = bool(last and now_ms - int(last) < COOLDOWN_MIN * 60 * 1000)
+                if rank_tags and not cooling:
+                    tags += rank_tags
+                    rank_line = rank_txt
+
+            # C：回调再启动形态（同一次形态只推一次）
+            shape_key = None
+            if ENABLE_SHAPE_TRIGGER:
+                try:
+                    ks = [k for k in get_klines(inst, SHAPE_BAR, 150) if k[8] == "1"]
+                    sh = detect_shape(ks, direction)
+                except Exception as e:
+                    print(f"{inst} 形态检测失败: {e}", file=sys.stderr)
+                    sh = None
+                time.sleep(0.15)
+                if sh:
+                    shape_key = f"{inst}|{direction}"
+                    if state["shape_seen"].get(shape_key) != str(sh["key_ts"]):
+                        tags.append("📐回调再启动" if direction == "up" else "📐反弹再下跌")
+                        shape_text = fmt_shape(direction, sh)
+                    else:
+                        sh = None
+                if not sh:
+                    shape_key = None
+
+            if not tags:
                 continue
 
             mom = None
@@ -289,8 +431,11 @@ def main():
 
             funding = get_funding(inst)
             time.sleep(0.1)
-            parts.append(fmt_item(item, direction, tags, rank_line, mom, funding))
-            state["last_alert"][key] = str(now_ms)
+            parts.append(fmt_item(item, direction, tags, rank_line, mom, funding, shape_text))
+            if rank_line:
+                state["last_alert"][f"{inst}|{direction}"] = str(now_ms)
+            if shape_key:
+                state["shape_seen"][shape_key] = str(sh["key_ts"])
 
         # 记录本轮快照，只保留最近 HIST_MAX_AGE 分钟
         hist.append((now_ms, {r["inst"]: r["rank"] for r in board}))
@@ -300,7 +445,7 @@ def main():
         if parts:
             push_to_dingtalk(title, "\n\n———\n\n".join(parts))
         else:
-            print(f"{'涨幅榜' if direction == 'up' else '跌幅榜'}：本轮没有新进榜或排名飙升的币")
+            print(f"{'涨幅榜' if direction == 'up' else '跌幅榜'}：本轮没有触发推送的币")
 
     # 清理超过 1 天的冷却记录，文件不会越来越大
     state["last_alert"] = {k: v for k, v in state["last_alert"].items() if now_ms - int(v) < 24 * 3600 * 1000}
