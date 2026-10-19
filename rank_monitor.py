@@ -318,7 +318,7 @@ def fmt_shape(direction, sh):
 def fmt_item(item, direction, tags, rank_line, mom, funding, shape_text=""):
     up = direction == "up"
     lines = [
-        f"{'📈 涨幅榜' if up else '📉 跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}  {' '.join(tags)}",
+        f"{'📈 做多' if up else '📉 做空'}  {'涨幅榜' if up else '跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}  {' '.join(tags)}",
         *([rank_line] if rank_line else []),
         f"24h {item['chg']*100:+.1f}%，现价 {item['last']:.6g}，24h成交额 {item['turnover']/1e6:.0f}M USDT",
     ]
@@ -357,8 +357,8 @@ def main():
         print("跌幅榜前5: " + "，".join(f"{r['inst'].split('-')[0]} {r['chg']*100:+.1f}%" for r in down[:5]))
 
     for direction, board, hist_key, title in (
-        ("up", up, "hist_up", "合约涨幅榜提醒"),
-        ("down", down, "hist_down", "合约跌幅榜提醒"),
+        ("up", up, "hist_up", "合约涨幅榜提醒【偏多】"),
+        ("down", down, "hist_down", "合约跌幅榜提醒【偏空】"),
     ):
         hist = [(int(ts), ranks) for ts, ranks in state.get(hist_key, [])]
         prev = _pick(hist, now_ms, 0, PREV_MAX_AGE, target_min=0)       # 最近一轮
