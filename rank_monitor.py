@@ -56,6 +56,8 @@ RESTART_VOL_BASE_BARS = 8       # 成交量对比：回调整理期（再往前 
 RESTART_VOL_RATIO = 1.0         # 站上时的成交量 >= 整理期均量 * 该倍数
 RESTART_MA7_TOL = 0.02          # MA7 不能比 MA25 低超过 2%
 RESTART_MAX_EXT = 0.06          # 现价离 MA25 超过 6% 不推（别追）
+SHAPE_COOLDOWN_MIN = 720        # 同一个币同一方向，形态信号 12 小时内只推一次
+SHAPE_SAME_PEAK_TOL = 0.003     # 高点（低点）相差不到 0.3% 视为同一波，同一波永远只推一次
 
 # 下面三项只用来在消息里显示"动量"，默认不作为推送条件；想当条件就把 REQUIRE_MOMENTUM 改成 True
 REQUIRE_MOMENTUM = False
@@ -223,6 +225,16 @@ def get_momentum(item):
     return move, (quote / avg_hour if avg_hour > 0 else 0)
 
 
+def fmt_time(ms):
+    """毫秒时间戳 -> 北京时间 'MM-DD HH:MM'"""
+    dt = datetime.datetime.fromtimestamp(int(ms) / 1000, tz=datetime.timezone.utc) + datetime.timedelta(hours=8)
+    return dt.strftime("%m-%d %H:%M")
+
+
+def _bar_ms(bar):
+    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1H": 60}.get(bar, 15) * 60 * 1000
+
+
 # ---------- C：回调再启动形态 ----------
 def ma(values, n, end):
     if end + 1 < n:
@@ -304,21 +316,37 @@ def detect_shape(klines, direction):
             "ma7": ma(c, 7, i), "ma25": ma(c, 25, i), "ma99": ma(c, 99, i)}
 
 
+def shape_is_new(state, key, sh, now_ms):
+    """同一个币同一方向：冷却期内不重复推；同一波（高点/低点几乎一样）不重复推。旧格式记录按 key_ts 比较"""
+    seen = state["shape_seen"].get(key)
+    if seen is None:
+        return True
+    if not isinstance(seen, dict):                      # 旧版本留下的记录
+        return str(seen) != str(sh["key_ts"])
+    if now_ms - int(seen["at"]) < SHAPE_COOLDOWN_MIN * 60 * 1000:
+        return False
+    if abs(sh["extreme"] / float(seen["peak"]) - 1) < SHAPE_SAME_PEAK_TOL:
+        return False
+    return True
+
+
 def fmt_shape(direction, sh):
     up = direction == "up"
     return (
         f"形态（{SHAPE_BAR}）：{'强势回调再启动' if up else '弱势反弹再下跌'}"
         f"{'，已创新高' if up and sh['new_extreme'] else '，已创新低' if (not up) and sh['new_extreme'] else ''}\n"
         f"前一波{'拉升 +' if up else '下跌 -'}{sh['move_pct']*100:.0f}%（{'高' if up else '低'}点 {sh['extreme']:.6g}），"
-        f"{'回调' if up else '反弹'}了 {sh['retrace']*100:.0f}%，{'站上' if up else '跌破'}MA25 已过 {sh['bars_after']} 根\n"
+        f"{'回调' if up else '反弹'}了 {sh['retrace']*100:.0f}%，{'站上' if up else '跌破'}MA25 的K线收盘于 "
+        f"{fmt_time(int(sh['key_ts']) + _bar_ms(SHAPE_BAR))}（已过 {sh['bars_after']} 根）\n"
         f"MA7 {sh['ma7']:.6g} / MA25 {sh['ma25']:.6g} / MA99 {sh['ma99']:.6g}"
     )
 
 
-def fmt_item(item, direction, tags, rank_line, mom, funding, shape_text=""):
+def fmt_item(item, direction, tags, rank_line, mom, funding, shape_text="", now_ms=None):
     up = direction == "up"
     lines = [
         f"{'📈 做多' if up else '📉 做空'}  {'涨幅榜' if up else '跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}  {' '.join(tags)}",
+        f"时间 {fmt_time(now_ms if now_ms is not None else time.time() * 1000)}（北京时间）",
         *([rank_line] if rank_line else []),
         f"24h {item['chg']*100:+.1f}%，现价 {item['last']:.6g}，24h成交额 {item['turnover']/1e6:.0f}M USDT",
     ]
@@ -405,7 +433,7 @@ def main():
                 time.sleep(0.15)
                 if sh:
                     shape_key = f"{inst}|{direction}"
-                    if state["shape_seen"].get(shape_key) != str(sh["key_ts"]):
+                    if shape_is_new(state, shape_key, sh, now_ms):
                         tags.append("📐回调再启动" if direction == "up" else "📐反弹再下跌")
                         shape_text = fmt_shape(direction, sh)
                     else:
@@ -431,11 +459,11 @@ def main():
 
             funding = get_funding(inst)
             time.sleep(0.1)
-            parts.append(fmt_item(item, direction, tags, rank_line, mom, funding, shape_text))
+            parts.append(fmt_item(item, direction, tags, rank_line, mom, funding, shape_text, now_ms))
             if rank_line:
                 state["last_alert"][f"{inst}|{direction}"] = str(now_ms)
             if shape_key:
-                state["shape_seen"][shape_key] = str(sh["key_ts"])
+                state["shape_seen"][shape_key] = {"key_ts": str(sh["key_ts"]), "peak": sh["extreme"], "at": now_ms}
 
         # 记录本轮快照，只保留最近 HIST_MAX_AGE 分钟
         hist.append((now_ms, {r["inst"]: r["rank"] for r in board}))
@@ -449,6 +477,8 @@ def main():
 
     # 清理超过 1 天的冷却记录，文件不会越来越大
     state["last_alert"] = {k: v for k, v in state["last_alert"].items() if now_ms - int(v) < 24 * 3600 * 1000}
+    state["shape_seen"] = {k: v for k, v in state["shape_seen"].items()
+                           if not isinstance(v, dict) or now_ms - int(v["at"]) < 3 * 24 * 3600 * 1000}
     state.pop("prev_up", None)
     state.pop("prev_down", None)
     save_state(state)
