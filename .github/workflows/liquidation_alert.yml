@@ -1,1 +1,27 @@
-
+   name: liquidation_alert
+   on:
+     schedule:
+       - cron: "*/15 * * * *"
+     workflow_dispatch:
+   permissions:
+     contents: write
+   jobs:
+     run:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         - uses: actions/setup-python@v5
+           with:
+             python-version: "3.12"
+         - run: pip install requests
+         - run: python liquidation_alert.py
+           env:
+             DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+             DINGTALK_WEBHOOK_RANK: ${{ secrets.DINGTALK_WEBHOOK_RANK }}
+         - run: |
+             git config user.name "bot"
+             git config user.email "bot@users.noreply.github.com"
+             git add git add git add liq_state.json || true
+             git commit -m "update pattern state" || true
+             git pull --rebase || true
+             git push || true
