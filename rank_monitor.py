@@ -56,6 +56,10 @@ RESTART_VOL_BASE_BARS = 8       # 成交量对比：回调整理期（再往前 
 RESTART_VOL_RATIO = 1.0         # 站上时的成交量 >= 整理期均量 * 该倍数
 RESTART_MA7_TOL = 0.02          # MA7 不能比 MA25 低超过 2%
 RESTART_MAX_EXT = 0.06          # 现价离 MA25 超过 6% 不推（别追）
+# 形态信号只给"现在正在大幅异动"的币（像 ARIA 那种），已经走完、成交量枯竭的币不推
+SHAPE_MIN_CHANGE_24H = 0.20     # 24小时涨幅（跌幅榜则是跌幅）至少 20%
+SHAPE_MIN_MOVE_1H = 0.005       # 近1小时同方向至少 0.5%（回调再启动正在往上走，而不是还在掉头）
+SHAPE_MIN_VOL_BOOST = 1.0       # 近1小时成交额 >= 日均每小时的 1 倍（量能没有枯竭）
 SHAPE_COOLDOWN_MIN = 720        # 同一个币同一方向，形态信号 12 小时内只推一次
 SHAPE_SAME_PEAK_TOL = 0.003     # 高点（低点）相差不到 0.3% 视为同一波，同一波永远只推一次
 
@@ -376,6 +380,8 @@ def main():
     state.setdefault("last_alert", {})
     state.setdefault("shape_seen", {})
     now_ms = int(time.time() * 1000)
+    print(f"读取状态：涨幅榜快照 {len(state.get('hist_up', []))} 份，跌幅榜快照 {len(state.get('hist_down', []))} 份，"
+          f"已推过的形态 {len(state['shape_seen'])} 个，冷却记录 {len(state['last_alert'])} 个")
 
     up, down = build_rankings()
     print(f"榜单：涨幅榜 {len(up)} 个，跌幅榜 {len(down)} 个（成交额≥{MIN_TURNOVER_USDT/1e6:.0f}M）")
@@ -421,9 +427,10 @@ def main():
                     tags += rank_tags
                     rank_line = rank_txt
 
-            # C：回调再启动形态（同一次形态只推一次）
+            # C：回调再启动形态（同一次形态只推一次；只给正在大幅异动、量能没枯竭的币）
             shape_key = None
-            if ENABLE_SHAPE_TRIGGER:
+            mom = None
+            if ENABLE_SHAPE_TRIGGER and abs(item["chg"]) >= SHAPE_MIN_CHANGE_24H:
                 try:
                     ks = [k for k in get_klines(inst, SHAPE_BAR, 150) if k[8] == "1"]
                     sh = detect_shape(ks, direction)
@@ -431,6 +438,17 @@ def main():
                     print(f"{inst} 形态检测失败: {e}", file=sys.stderr)
                     sh = None
                 time.sleep(0.15)
+                if sh:                                          # 形态成立后，再看近1小时动量和量能
+                    try:
+                        mom = get_momentum(item)
+                    except Exception as e:
+                        print(f"{inst} 取K线失败: {e}", file=sys.stderr)
+                        mom = None
+                    time.sleep(0.15)
+                    move_ok = bool(mom) and (mom[0] >= SHAPE_MIN_MOVE_1H if direction == "up" else mom[0] <= -SHAPE_MIN_MOVE_1H)
+                    if not (move_ok and mom[1] >= SHAPE_MIN_VOL_BOOST):
+                        print(f"{inst} 形态成立但动量/量能不足，跳过（近1小时 {mom[0]*100:+.1f}%，量能 {mom[1]:.1f} 倍）" if mom else f"{inst} 形态成立但取不到动量，跳过")
+                        sh = None
                 if sh:
                     shape_key = f"{inst}|{direction}"
                     if shape_is_new(state, shape_key, sh, now_ms):
@@ -444,12 +462,12 @@ def main():
             if not tags:
                 continue
 
-            mom = None
-            try:
-                mom = get_momentum(item)
-            except Exception as e:
-                print(f"{inst} 取K线失败: {e}", file=sys.stderr)
-            time.sleep(0.15)
+            if mom is None:
+                try:
+                    mom = get_momentum(item)
+                except Exception as e:
+                    print(f"{inst} 取K线失败: {e}", file=sys.stderr)
+                time.sleep(0.15)
             if REQUIRE_MOMENTUM:
                 if not mom:
                     continue
