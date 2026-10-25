@@ -19,6 +19,7 @@ OKX 永续合约 - 山寨币形态扫描（做空 / 做多 三种形态），命
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -35,6 +36,15 @@ def format_candle_time(ts_ms):
     ts = int(ts_ms) / 1000
     dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc) + datetime.timedelta(hours=8)
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def fmt_px(x):
+    """价格：保留 6 位有效数字，不用科学计数法（4.373e-06 会显示成 0.000004373）"""
+    x = float(x)
+    if x == 0:
+        return "0"
+    digits = max(0, 5 - int(math.floor(math.log10(abs(x)))))
+    return f"{x:.{digits}f}".rstrip("0").rstrip(".") if digits else f"{x:.0f}"
 
 
 def get_klines(symbol, interval, limit):
@@ -147,7 +157,19 @@ SAME_SIDE_COOLDOWN_MIN = 60      # 同一个币同方向信号，60 分钟内只
 MAX_PUSH = 3                # 每种形态每轮最多推 3 个币，宁缺毋滥
 
 # 个别形态用别的周期看（其余形态用上面的 BAR）。强势回调再启动的拉升/回调动辄十几个小时，用 15 分钟线才看得全
-PATTERN_BAR = {"restart": "15m", "weak_restart": "15m"}
+PATTERN_BAR = {"restart": "15m", "weak_restart": "15m", "retest_short": "15m", "retest_long": "15m"}
+
+# --- MA99 回抽失败（做空）/ 回踩确认（做多）：对应 ADA 那种 "冲高 → 跌破MA99 → 回抽不过 → 再下跌"（15 分钟线）---
+RT_BREAK_LOOKBACK = 24      # 跌破 MA99 发生在最近多少根以内
+RT_ABOVE_BARS = 12          # 跌破之前，至少连续这么多根收盘在 MA99 上方（说明之前是强势）
+RT_RALLY_MIN = 0.03         # 跌破之前的高点，至少比 MA99 高 3%
+RT_BOUNCE_MIN = 0.005       # 跌破后的反弹幅度至少 0.5%
+RT_TOUCH_TOL = 0.004        # 回抽高点要碰到 MA99 附近（相差 0.4% 以内）
+RT_NO_RECLAIM = 0.004       # 回抽期间收盘不能站上 MA99 超过 0.4%
+RT_MAX_BARS_AFTER_PEAK = 3  # 回抽高点之后 3 根内出现确认阴线才推
+RT_RISK_MIN = 0.002
+RT_RISK_MAX = 0.03          # 止损（回抽高点上方）距离最大 3%
+HTF_EXEMPT = {"retest_short", "retest_long"}   # 这两种是"趋势刚转折"的形态，1 小时趋势往往还没转过来，不套 1H 同向过滤
 STATE_FILE = "seen_pattern_ts.txt"
 # ==============================
 
@@ -371,7 +393,7 @@ def detect_trend_pullback(klines, side):
 
 FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
 # 每种形态的方向：long 做多 / short 做空
-SIDE = {"fake": "short", "breakout": "long", "restart": "long", "bounce_short": "short", "bounce_long": "long", "breakdown": "short", "weak_restart": "short", "trend_long": "long", "trend_short": "short"}
+SIDE = {"fake": "short", "breakout": "long", "restart": "long", "retest_short": "short", "retest_long": "long", "bounce_short": "short", "bounce_long": "long", "breakdown": "short", "weak_restart": "short", "trend_long": "long", "trend_short": "short"}
 
 
 def get_funding(inst_id):
@@ -534,6 +556,78 @@ def htf_trend(inst_id):
         return None
 
 
+def detect_retest_short(klines):
+    """做空：之前强势（连续在 MA99 上方并有一波冲高），跌破 MA99 后反弹回抽 MA99 附近没站上，出现确认阴线"""
+    n = len(klines)
+    if n < 130:
+        return None
+    o, h, l, c, v = _arrays(klines)
+    i = n - 1
+    m99 = [ma(c, 99, j) for j in range(n)]
+
+    b = None                                       # 第一根收盘跌破 MA99 的 K 线
+    for j in range(i - 1, max(i - RT_BREAK_LOOKBACK, 98 + RT_ABOVE_BARS + 1) - 1, -1):
+        if c[j] < m99[j] and c[j - 1] >= m99[j - 1]:
+            if all(c[k] > m99[k] * 0.998 for k in range(j - RT_ABOVE_BARS, j)):
+                b = j
+                break
+    if b is None or i - b < 4:
+        return None
+
+    pre_peak = max(h[b - RT_ABOVE_BARS:b])
+    if pre_peak < m99[b] * (1 + RT_RALLY_MIN):
+        return None
+
+    j_peak = max(range(b + 1, i), key=lambda x: h[x])          # 跌破后的回抽高点
+    if not (1 <= i - j_peak <= RT_MAX_BARS_AFTER_PEAK) or j_peak - b < 2:
+        return None
+    peak = h[j_peak]
+    if peak < m99[j_peak] * (1 - RT_TOUCH_TOL) or peak > m99[j_peak] * (1 + RT_NO_RECLAIM + 0.004):
+        return None
+    if any(c[k] > m99[k] * (1 + RT_NO_RECLAIM) for k in range(b + 1, i)):
+        return None
+    low_between = min(l[b:j_peak + 1])
+    if (peak - low_between) / low_between < RT_BOUNCE_MIN:
+        return None
+
+    m25, m25_6, m7 = ma(c, 25, i), ma(c, 25, i - 6), ma(c, 7, i)
+    if not (c[i] < m99[i] and m25 < m25_6):
+        return None
+    if not (c[i] < o[i] and c[i] < c[i - 1] and (c[i] < m7 or c[i] < l[i - 1])):
+        return None
+
+    stop = peak * 1.002
+    risk = (stop - c[i]) / c[i]
+    if not (RT_RISK_MIN <= risk <= RT_RISK_MAX):
+        return None
+    return {
+        "key_ts": klines[b][0], "ts": klines[i][0], "side": "short",
+        "price": c[i], "stop": stop,
+        "target1": c[i] - 1.5 * (stop - c[i]), "target2": c[i] - 3 * (stop - c[i]),
+        "risk": risk, "peak": peak, "pre_peak": pre_peak, "ma99": m99[i],
+        "gap": (m99[j_peak] - peak) / m99[j_peak], "bars_after": i - j_peak,
+    }
+
+
+def detect_retest_long(klines):
+    """做多：detect_retest_short 的镜像（之前弱势，突破 MA99 后回踩 MA99 附近不破，出现确认阳线）"""
+    r = detect_retest_short(invert_klines(klines))
+    if not r:
+        return None
+    c = [float(k[4]) for k in klines]
+    i = len(c) - 1
+    price, stop = 1 / r["price"], 1 / r["stop"]
+    m99 = ma(c, 99, i)
+    low = 1 / r["peak"]
+    return {
+        "key_ts": r["key_ts"], "ts": r["ts"], "side": "long",
+        "price": price, "stop": stop,
+        "target1": price + 1.5 * (price - stop), "target2": price + 3 * (price - stop),
+        "risk": abs(price - stop) / price, "peak": low, "pre_peak": 1 / r["pre_peak"], "ma99": m99,
+        "gap": abs(low - m99) / m99, "bars_after": r["bars_after"],
+    }
+
+
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
@@ -639,8 +733,8 @@ def fmt_fake(sym, r):
     return (
         f"📉 做空 {sym.replace('-SWAP', '')} ({BAR}) 假突破回落 [{tag}]\n"
         f"冲高K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
-        f"冲高最高 {r['spike_high']}（高出横盘上沿 {r['spike_pct']*100:.1f}%），前高 {r['prior_peak']}\n"
-        f"横盘区间 {r['base_lo']} ~ {r['base_hi']}，现价 {r['price']}（已跌回区间内）\n"
+        f"冲高最高 {fmt_px(r['spike_high'])}（高出横盘上沿 {r['spike_pct']*100:.1f}%），前高 {fmt_px(r['prior_peak'])}\n"
+        f"横盘区间 {fmt_px(r['base_lo'])} ~ {fmt_px(r['base_hi'])}，现价 {fmt_px(r['price'])}（已跌回区间内）\n"
         f"冲高前均线粘合度 {r['ma_gap']*100:.2f}%，冲高量能 {r['vol_ratio']:.1f} 倍"
     )
 
@@ -650,8 +744,8 @@ def fmt_breakout(sym, r):
     return (
         f"📈 做多 {sym.replace('-SWAP', '')} ({BAR}) 放量突破 [{tag}]\n"
         f"突破K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
-        f"冲高最高 {r['spike_high']}（高出横盘上沿 {r['spike_pct']*100:.1f}%），现价 {r['price']}（站稳上沿 {r['base_hi']} 之上）\n"
-        f"横盘区间 {r['base_lo']} ~ {r['base_hi']}\n"
+        f"冲高最高 {fmt_px(r['spike_high'])}（高出横盘上沿 {r['spike_pct']*100:.1f}%），现价 {fmt_px(r['price'])}（站稳上沿 {fmt_px(r['base_hi'])} 之上）\n"
+        f"横盘区间 {fmt_px(r['base_lo'])} ~ {fmt_px(r['base_hi'])}\n"
         f"突破前均线粘合度 {r['ma_gap']*100:.2f}%，突破量能 {r['vol_ratio']:.1f} 倍"
     )
 
@@ -661,8 +755,8 @@ def fmt_restart(sym, r):
     return (
         f"📈 做多 {sym.replace('-SWAP', '')} ({r.get('bar', BAR)}) 强势回调再启动 [{tag}]\n"
         f"站上MA25: {format_candle_time(r['key_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
-        f"前一波拉升 +{r['pump_pct']*100:.0f}%（高点 {r['peak']}），回调了 {r['retrace']*100:.0f}%，现价 {r['price']}\n"
-        f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
+        f"前一波拉升 +{r['pump_pct']*100:.0f}%（高点 {fmt_px(r['peak'])}），回调了 {r['retrace']*100:.0f}%，现价 {fmt_px(r['price'])}\n"
+        f"MA7 {fmt_px(r['ma7'])} / MA25 {fmt_px(r['ma25'])} / MA99 {fmt_px(r['ma99'])}"
     )
 
 
@@ -670,10 +764,10 @@ def fmt_trend(sym, r):
     long_ = r["side"] == "long"
     return (
         f"{'📈 做多' if long_ else '📉 做空'} {sym.replace('-SWAP', '')} ({BAR}) 顺势回踩进场\n"
-        f"信号K线收盘: {format_candle_time(r['ts'])}（北京时间），参考入场价 {r['price']:.6g}\n"
-        f"止损 {r['stop']:.6g}（距离 {r['risk']*100:.1f}%），"
-        f"目标1 {r['target1']:.6g}（前{'高' if long_ else '低'}，盈亏比 {r['rr']:.1f}），目标2 {r['target2']:.6g}（2R）\n"
-        f"回踩幅度 {r['depth']*100:.1f}%，MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
+        f"信号K线收盘: {format_candle_time(r['ts'])}（北京时间），参考入场价 {fmt_px(r['price'])}\n"
+        f"止损 {fmt_px(r['stop'])}（距离 {r['risk']*100:.1f}%），"
+        f"目标1 {fmt_px(r['target1'])}（前{'高' if long_ else '低'}，盈亏比 {r['rr']:.1f}），目标2 {fmt_px(r['target2'])}（2R）\n"
+        f"回踩幅度 {r['depth']*100:.1f}%，MA25 {fmt_px(r['ma25'])} / MA99 {fmt_px(r['ma99'])}"
     )
 
 
@@ -682,8 +776,8 @@ def fmt_breakdown(sym, r):
     return (
         f"📉 做空 {sym.replace('-SWAP', '')} ({BAR}) 放量下破 [{tag}]\n"
         f"下破K线: {format_candle_time(r['spike_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
-        f"下探最低 {r['spike_low']}（低于横盘下沿 {r['spike_pct']*100:.1f}%），现价 {r['price']}（站稳下沿 {r['base_lo']} 之下）\n"
-        f"横盘区间 {r['base_lo']} ~ {r['base_hi']}\n"
+        f"下探最低 {fmt_px(r['spike_low'])}（低于横盘下沿 {r['spike_pct']*100:.1f}%），现价 {fmt_px(r['price'])}（站稳下沿 {fmt_px(r['base_lo'])} 之下）\n"
+        f"横盘区间 {fmt_px(r['base_lo'])} ~ {fmt_px(r['base_hi'])}\n"
         f"下破前均线粘合度 {r['ma_gap']*100:.2f}%，下破量能 {r['vol_ratio']:.1f} 倍"
     )
 
@@ -693,8 +787,8 @@ def fmt_weak_restart(sym, r):
     return (
         f"📉 做空 {sym.replace('-SWAP', '')} ({r.get('bar', BAR)}) 弱势反弹再下跌 [{tag}]\n"
         f"跌破MA25: {format_candle_time(r['key_ts'])}（北京时间），已过 {r['bars_after']} 根\n"
-        f"前一波下跌约 -{r['drop_pct']*100:.0f}%（低点 {r['trough']:.6g}），反弹了 {r['retrace']*100:.0f}%，现价 {r['price']}\n"
-        f"MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g} / MA99 {r['ma99']:.6g}"
+        f"前一波下跌约 -{r['drop_pct']*100:.0f}%（低点 {fmt_px(r['trough'])}），反弹了 {r['retrace']*100:.0f}%，现价 {fmt_px(r['price'])}\n"
+        f"MA7 {fmt_px(r['ma7'])} / MA25 {fmt_px(r['ma25'])} / MA99 {fmt_px(r['ma99'])}"
     )
 
 
@@ -703,9 +797,23 @@ def fmt_bounce(sym, r):
     return (
         f"{'📈 做多' if long_ else '📉 做空'} {sym.replace('-SWAP', '')} ({BAR}) {'回踩企稳' if long_ else '反弹受阻'}\n"
         f"确认K线收盘: {format_candle_time(r['ts'])}（北京时间），距{'回踩低点' if long_ else '反弹高点'}已过 {r['bars_after']} 根\n"
-        f"参考入场价 {r['price']:.6g}，止损 {r['stop']:.6g}（距离 {r['risk']*100:.1f}%）\n"
-        f"目标1 {r['target1']:.6g}（近期{'高' if long_ else '低'}，盈亏比 {r['rr']:.1f}），目标2 {r['target2']:.6g}（2R）\n"
-        f"{'回踩' if long_ else '反弹'}幅度 {r['bounce']*100:.1f}%，MA7 {r['ma7']:.6g} / MA25 {r['ma25']:.6g}"
+        f"参考入场价 {fmt_px(r['price'])}，止损 {fmt_px(r['stop'])}（距离 {r['risk']*100:.1f}%）\n"
+        f"目标1 {fmt_px(r['target1'])}（近期{'高' if long_ else '低'}，盈亏比 {r['rr']:.1f}），目标2 {fmt_px(r['target2'])}（2R）\n"
+        f"{'回踩' if long_ else '反弹'}幅度 {r['bounce']*100:.1f}%，MA7 {fmt_px(r['ma7'])} / MA25 {fmt_px(r['ma25'])}"
+    )
+
+
+def fmt_retest(sym, r):
+    long_ = r["side"] == "long"
+    return (
+        f"{'📈 做多' if long_ else '📉 做空'} {sym.replace('-SWAP', '')} ({r.get('bar', BAR)}) "
+        f"{'突破MA99后回踩确认' if long_ else '跌破MA99后回抽失败'}\n"
+        f"{'突破' if long_ else '跌破'}MA99 的K线: {format_candle_time(r['key_ts'])}（北京时间）\n"
+        f"{'回踩低点' if long_ else '回抽高点'} {fmt_px(r['peak'])}（距MA99 {r['gap']*100:.2f}%），"
+        f"确认K线时间 {format_candle_time(r['ts'])}\n"
+        f"参考入场价 {fmt_px(r['price'])}，止损 {fmt_px(r['stop'])}（距离 {r['risk']*100:.1f}%）\n"
+        f"目标1 {fmt_px(r['target1'])}（1.5R），目标2 {fmt_px(r['target2'])}（3R）\n"
+        f"此前{'低' if long_ else '高'}点 {fmt_px(r['pre_peak'])}，现 MA99 {fmt_px(r['ma99'])}"
     )
 
 
@@ -718,6 +826,8 @@ PATTERNS = {
     "weak_restart": (detect_weak_restart, fmt_weak_restart, "合约形态提醒【偏空】弱势反弹再下跌"),
     "bounce_short": (detect_bounce_fail_short, fmt_bounce, "合约形态提醒【偏空】反弹受阻"),
     "bounce_long": (detect_bounce_fail_long, fmt_bounce, "合约形态提醒【偏多】回踩企稳"),
+    "retest_short": (detect_retest_short, fmt_retest, "合约形态提醒【偏空】跌破MA99后回抽失败"),
+    "retest_long": (detect_retest_long, fmt_retest, "合约形态提醒【偏多】突破MA99后回踩确认"),
     "trend_long": (lambda k: detect_trend_pullback(k, "long"), fmt_trend, "合约形态提醒【偏多】趋势回踩进场"),
     "trend_short": (lambda k: detect_trend_pullback(k, "short"), fmt_trend, "合约形态提醒【偏空】趋势回踩进场"),
 }
@@ -727,7 +837,7 @@ PATTERNS = {
 # 默认只开 5 种：条件最严、出现最少、带止损/目标位的。
 # 关掉的 3 种：weak_restart、bounce_short / bounce_long（后两种出现太频繁，没验证过）。restart（强势回调再启动，用 15 分钟线看）已按 ARIA 那张图放宽后重新打开。
 # 想打开，把名字加回这个集合即可。
-ENABLED_PATTERNS = {"fake", "breakout", "breakdown", "trend_long", "trend_short"}   # restart 已搬到 rank_monitor.py（只在涨跌幅榜里找）；想在全部币里找，把 "restart" 加回来
+ENABLED_PATTERNS = {"fake", "breakout", "breakdown", "trend_long", "trend_short", "retest_short", "retest_long"}   # restart 已搬到 rank_monitor.py（只在涨跌幅榜里找）；想在全部币里找，把 "restart" 加回来
 
 
 def main():
@@ -736,6 +846,7 @@ def main():
         return
 
     state = load_state()
+    print(f"读取状态：已有 {len(state)} 条记录（信号去重/冷却）。如果每轮都是 0，说明状态没有保存成功，会重复推送")
 
     symbols = list_candidates()
     print(f"本次扫描 {len(symbols)} 个币 ({BAR})")
@@ -822,7 +933,7 @@ def main():
         for sym, r in items:
             # 大周期方向过滤
             trend = None
-            if USE_HTF_FILTER:
+            if USE_HTF_FILTER and name not in HTF_EXEMPT:
                 trend = htf_trend(sym)
                 time.sleep(0.1)
                 if trend is not None:
