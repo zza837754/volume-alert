@@ -708,7 +708,10 @@ def list_candidates():
         coin = inst.split("-")[0]
         if coin in EXCLUDE:
             continue
-        turnover = float(t["volCcy24h"]) * float(t["last"])   # 币本位数量 × 最新价 ≈ USDT成交额
+        try:
+            turnover = float(t["volCcy24h"]) * float(t["last"])   # 币本位数量 × 最新价 ≈ USDT成交额
+        except (ValueError, KeyError, TypeError):
+            continue    # 刚上线或暂停交易的合约，字段可能是空字符串，直接跳过
         if turnover >= MIN_TURNOVER_USDT:
             rows.append((inst, turnover))
     rows.sort(key=lambda x: x[1], reverse=True)
