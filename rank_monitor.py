@@ -10,6 +10,10 @@ OKX 永续合约 涨幅榜 / 跌幅榜 监控
        C. 回调再启动形态（15 分钟线）：
             涨幅榜：前面一波拉升 → 回调 → 重新站上 MA25 和 MA7（ARIA 那种走势）
             跌幅榜：镜像，前面一波暴跌 → 反弹 → 重新跌破 MA25 和 MA7
+       D. 早期异动（默认开启，主要靠它抢在行情前面）：在成交额靠前的 EARLY_TOP_N 个币里（不限榜单），
+          最近 15 分钟涨/跌幅达到 EARLY_MOVE_15M、成交量明显放大、而此前 1 小时还很平静，且现价仍在极值附近
+       E. 放量榜（默认开启，不看涨跌幅）：同样的币池里，按"最近 15 分钟成交额 / 此前均值"排名，
+          放量 >= VOLBOARD_RATIO 倍、但价格还没怎么动（没被 D 抓到）的币上榜，提示"放量待变盘"
   3) A/B 同一个币同一方向 COOLDOWN_MIN 分钟内只推一次；C 同一次形态只推一次
 
 说明：
@@ -21,9 +25,12 @@ OKX 永续合约 涨幅榜 / 跌幅榜 监控
 
 import datetime
 import json
+import math
 import os
 import sys
 import time
+
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -40,8 +47,26 @@ HIST_MAX_AGE = 90               # 快照最多保留多久（分钟）
 PREV_MAX_AGE = 30               # "上一轮"快照超过这么久就不算（比如中途停跑过），避免误判新进榜
 
 # --- 触发开关 ---
-ENABLE_RANK_TRIGGERS = True     # A/B：新进榜、排名飙升
+# A/B 按 24 小时涨跌幅排名，币要先涨/跌很多才进得了榜，天然滞后，所以默认关闭
+ENABLE_RANK_TRIGGERS = False    # A/B：新进榜、排名飙升
 ENABLE_SHAPE_TRIGGER = True     # C：回调再启动形态
+ENABLE_EARLY_TRIGGER = True     # D：早期异动
+
+ENABLE_VOLUME_BOARD = True      # E：放量榜（成交额先放大，价格还没动）
+
+# --- E：放量榜 ---
+VOLBOARD_RATIO = 4.0            # 最近 15 分钟成交额 >= 此前均值的 4 倍（没有价格确认，所以比 D 的 3 倍更严）
+VOLBOARD_MAX_PUSH = 5           # 每轮最多推几个（按放量倍数从高到低）
+VOLBOARD_COOLDOWN_MIN = 60      # 同一个币 60 分钟内只推一次
+
+# --- D：早期异动（5 分钟线）---
+EARLY_TOP_N = 120               # 在成交额前 120 的币里找（不限于涨跌幅榜前 30）
+EARLY_MOVE_15M = 0.025          # 最近 15 分钟（3 根）涨/跌幅至少 2.5%
+EARLY_PRIOR_MAX = 0.02          # 此前 1 小时（再往前 12 根）累计波动不超过 2%：说明是刚开始，不是追在已经走完的行情后面
+EARLY_VOL_RATIO = 3.0           # 最近 15 分钟成交额 >= 此前 2 小时同样长度均值的 3 倍
+EARLY_STILL_MOVING = 0.005      # 现价离最近 15 分钟的极值不超过 0.5%（还在走，不是已经反弹回来）
+EARLY_COOLDOWN_MIN = 60         # 同一个币同一方向 60 分钟内只推一次
+EARLY_MAX_PUSH = 5             # 每个方向每轮最多推几个
 
 # --- C：回调再启动形态（15 分钟线）的参数，含义和 pattern_scanner.py 里一致 ---
 SHAPE_BAR = "15m"
@@ -212,7 +237,8 @@ def build_rankings():
         r["rank"] = i
     for i, r in enumerate(down, 1):
         r["rank"] = i
-    return up, down
+    rows.sort(key=lambda r: r["turnover"], reverse=True)
+    return up, down, rows
 
 
 def get_momentum(item):
@@ -227,6 +253,15 @@ def get_momentum(item):
     quote = sum(float(k[7]) if float(k[7]) > 0 else float(k[6]) * float(k[4]) for k in recent)
     avg_hour = item["turnover"] / 24
     return move, (quote / avg_hour if avg_hour > 0 else 0)
+
+
+def fmt_px(x):
+    """价格：保留 6 位有效数字，不用科学计数法（4.373e-06 会显示成 0.000004373）"""
+    x = float(x)
+    if x == 0:
+        return "0"
+    digits = max(0, 5 - int(math.floor(math.log10(abs(x)))))
+    return f"{x:.{digits}f}".rstrip("0").rstrip(".") if digits else f"{x:.0f}"
 
 
 def fmt_time(ms):
@@ -339,11 +374,93 @@ def fmt_shape(direction, sh):
     return (
         f"形态（{SHAPE_BAR}）：{'强势回调再启动' if up else '弱势反弹再下跌'}"
         f"{'，已创新高' if up and sh['new_extreme'] else '，已创新低' if (not up) and sh['new_extreme'] else ''}\n"
-        f"前一波{'拉升 +' if up else '下跌 -'}{sh['move_pct']*100:.0f}%（{'高' if up else '低'}点 {sh['extreme']:.6g}），"
+        f"前一波{'拉升 +' if up else '下跌 -'}{sh['move_pct']*100:.0f}%（{'高' if up else '低'}点 {fmt_px(sh['extreme'])}），"
         f"{'回调' if up else '反弹'}了 {sh['retrace']*100:.0f}%，{'站上' if up else '跌破'}MA25 的K线收盘于 "
         f"{fmt_time(int(sh['key_ts']) + _bar_ms(SHAPE_BAR))}（已过 {sh['bars_after']} 根）\n"
-        f"MA7 {sh['ma7']:.6g} / MA25 {sh['ma25']:.6g} / MA99 {sh['ma99']:.6g}"
+        f"MA7 {fmt_px(sh['ma7'])} / MA25 {fmt_px(sh['ma25'])} / MA99 {fmt_px(sh['ma99'])}"
     )
+
+
+# ---------- E：放量榜 ----------
+def volume_board_info(klines):
+    """放量倍数、近15分钟涨跌、与此前1小时区间的关系。数据不够返回 None"""
+    if len(klines) < 40:
+        return None
+    c = [float(k[4]) for k in klines]
+    h = [float(k[2]) for k in klines]
+    l = [float(k[3]) for k in klines]
+    q = [float(k[7]) if float(k[7]) > 0 else float(k[6]) * float(k[4]) for k in klines]
+    base = sum(q[-27:-3]) / 24 * 3
+    if base <= 0:
+        return None
+    hi, lo = max(h[-15:-3]), min(l[-15:-3])          # 此前 1 小时的区间（不含最近 15 分钟）
+    pos = "up" if c[-1] > hi else "down" if c[-1] < lo else "inside"
+    return {"ratio": sum(q[-3:]) / base, "move15": c[-1] / c[-4] - 1, "pos": pos, "hi": hi, "lo": lo, "price": c[-1]}
+
+
+def fmt_volume(rank, item, r, funding, now_ms):
+    lean = ("偏多（已向上突破此前区间）" if r["pos"] == "up" else
+            "偏空（已向下跌破此前区间）" if r["pos"] == "down" else
+            "偏多（价格在抬升）" if r["move15"] >= 0.003 else
+            "偏空（价格在走低）" if r["move15"] <= -0.003 else "方向待定")
+    pos_txt = {"up": "已突破上沿", "down": "已跌破下沿", "inside": "仍在区间内"}[r["pos"]]
+    lines = [
+        f"👀 放量榜 #{rank}  {item['inst'].replace('-SWAP', '')}  放量待变盘",
+        f"时间 {fmt_time(now_ms)}（北京时间）",
+        f"最近15分钟成交额是此前均值的 {r['ratio']:.1f} 倍，近15分钟价格 {r['move15']*100:+.1f}%（还没怎么动）",
+        f"此前1小时区间 {fmt_px(r['lo'])} ~ {fmt_px(r['hi'])}，现价 {fmt_px(r['price'])}（{pos_txt}）",
+        f"倾向：{lean}",
+        f"24h {item['chg']*100:+.1f}%，24h成交额 {item['turnover']/1e6:.0f}M USDT",
+    ]
+    if funding is not None:
+        lines.append(f"资金费率 {funding*100:+.3f}%")
+    return "\n".join(lines)
+
+
+# ---------- D：早期异动 ----------
+def detect_early(klines):
+    """最近 15 分钟（3 根 5 分钟线）刚启动的放量急涨/急跌。命中返回 dict，否则 None"""
+    if len(klines) < 40:
+        return None
+    c = [float(k[4]) for k in klines]
+    h = [float(k[2]) for k in klines]
+    l = [float(k[3]) for k in klines]
+    q = [float(k[7]) if float(k[7]) > 0 else float(k[6]) * float(k[4]) for k in klines]
+
+    move15 = c[-1] / c[-4] - 1
+    if abs(move15) < EARLY_MOVE_15M:
+        return None
+    prior = c[-4] / c[-16] - 1                     # 此前 1 小时
+    if abs(prior) > EARLY_PRIOR_MAX:
+        return None
+    base = sum(q[-27:-3]) / 24 * 3                 # 此前 24 根（2 小时）折算成 3 根的成交额
+    recent = sum(q[-3:])
+    if base <= 0 or recent / base < EARLY_VOL_RATIO:
+        return None
+    if move15 < 0:                                  # 还在往下：现价离最近 15 分钟最低点不远
+        direction = "down"
+        if (c[-1] - min(l[-3:])) / min(l[-3:]) > EARLY_STILL_MOVING:
+            return None
+    else:
+        direction = "up"
+        if (max(h[-3:]) - c[-1]) / max(h[-3:]) > EARLY_STILL_MOVING:
+            return None
+    return {"direction": direction, "move15": move15, "prior": prior, "ratio": recent / base, "price": c[-1]}
+
+
+def fmt_early(item, r, rank_txt, funding, now_ms):
+    up = r["direction"] == "up"
+    lines = [
+        f"{'📈 做多' if up else '📉 做空'}  ⚡早期异动  {item['inst'].replace('-SWAP', '')}",
+        f"时间 {fmt_time(now_ms)}（北京时间）",
+        f"近15分钟 {r['move15']*100:+.1f}%（此前1小时 {r['prior']*100:+.1f}%，刚启动），成交额是此前均值的 {r['ratio']:.1f} 倍",
+        f"现价 {fmt_px(r['price'])}，24h {item['chg']*100:+.1f}%，24h成交额 {item['turnover']/1e6:.0f}M USDT",
+    ]
+    if rank_txt:
+        lines.append(rank_txt)
+    if funding is not None:
+        lines.append(f"资金费率 {funding*100:+.3f}%")
+    return "\n".join(lines)
 
 
 def fmt_item(item, direction, tags, rank_line, mom, funding, shape_text="", now_ms=None):
@@ -352,7 +469,7 @@ def fmt_item(item, direction, tags, rank_line, mom, funding, shape_text="", now_
         f"{'📈 做多' if up else '📉 做空'}  {'涨幅榜' if up else '跌幅榜'} #{item['rank']}  {item['inst'].replace('-SWAP', '')}  {' '.join(tags)}",
         f"时间 {fmt_time(now_ms if now_ms is not None else time.time() * 1000)}（北京时间）",
         *([rank_line] if rank_line else []),
-        f"24h {item['chg']*100:+.1f}%，现价 {item['last']:.6g}，24h成交额 {item['turnover']/1e6:.0f}M USDT",
+        f"24h {item['chg']*100:+.1f}%，现价 {fmt_px(item['last'])}，24h成交额 {item['turnover']/1e6:.0f}M USDT",
     ]
     if shape_text:
         lines.append(shape_text)
@@ -383,12 +500,79 @@ def main():
     print(f"读取状态：涨幅榜快照 {len(state.get('hist_up', []))} 份，跌幅榜快照 {len(state.get('hist_down', []))} 份，"
           f"已推过的形态 {len(state['shape_seen'])} 个，冷却记录 {len(state['last_alert'])} 个")
 
-    up, down = build_rankings()
+    up, down, universe = build_rankings()
     print(f"榜单：涨幅榜 {len(up)} 个，跌幅榜 {len(down)} 个（成交额≥{MIN_TURNOVER_USDT/1e6:.0f}M）")
     if up:
         print("涨幅榜前5: " + "，".join(f"{r['inst'].split('-')[0]} {r['chg']*100:+.1f}%" for r in up[:5]))
     if down:
         print("跌幅榜前5: " + "，".join(f"{r['inst'].split('-')[0]} {r['chg']*100:+.1f}%" for r in down[:5]))
+
+    # ---- D：早期异动（不限榜单，看成交额前 EARLY_TOP_N 的币）----
+    if ENABLE_EARLY_TRIGGER or ENABLE_VOLUME_BOARD:
+        board_rank = {("up", r["inst"]): r["rank"] for r in up}
+        board_rank.update({("down", r["inst"]): r["rank"] for r in down})
+        cand = universe[:EARLY_TOP_N]
+
+        def fetch5(item):
+            try:
+                ks = [k for k in get_klines(item["inst"], "5m", 40) if k[8] == "1"]
+                return item, ks
+            except Exception as e:
+                print(f"{item['inst']} 5m K线获取失败: {e}", file=sys.stderr)
+                return item, None
+            finally:
+                time.sleep(0.2)
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            fetched = list(ex.map(fetch5, cand))
+        early_hits = {"up": [], "down": []}
+        for item, ks in fetched:
+            if not ks:
+                continue
+            r = detect_early(ks) if ENABLE_EARLY_TRIGGER else None
+            if not r:
+                continue
+            key = f"{item['inst']}|early_{r['direction']}"
+            last = state["last_alert"].get(key)
+            if last and now_ms - int(last) < EARLY_COOLDOWN_MIN * 60 * 1000:
+                continue
+            early_hits[r["direction"]].append((item, r))
+        print(f"早期异动：扫描 {len(cand)} 个币，命中 做多 {len(early_hits['up'])} 个 / 做空 {len(early_hits['down'])} 个")
+        for direction, title in (("up", "合约异动提醒【偏多】"), ("down", "合约异动提醒【偏空】")):
+            hits = sorted(early_hits[direction], key=lambda x: abs(x[1]["move15"]), reverse=True)[:EARLY_MAX_PUSH]
+            parts = []
+            for item, r in hits:
+                rk = board_rank.get((direction, item["inst"]))
+                rank_txt = f"当前{'涨幅榜' if direction == 'up' else '跌幅榜'} #{rk}" if rk else ""
+                parts.append(fmt_early(item, r, rank_txt, get_funding(item["inst"]), now_ms))
+                time.sleep(0.1)
+                state["last_alert"][f"{item['inst']}|early_{direction}"] = str(now_ms)
+            if parts:
+                push_to_dingtalk(title, "\n\n———\n\n".join(parts))
+
+        if ENABLE_VOLUME_BOARD:
+            early_keys = {(it["inst"], r["direction"]) for d_ in early_hits for it, r in early_hits[d_]}
+            early_insts = {k[0] for k in early_keys}
+            vol_hits = []
+            for item, ks in fetched:
+                if not ks or item["inst"] in early_insts:           # 已经被"早期异动"抓到的不重复
+                    continue
+                info = volume_board_info(ks)
+                if not info or info["ratio"] < VOLBOARD_RATIO or abs(info["move15"]) >= EARLY_MOVE_15M:
+                    continue
+                last = state["last_alert"].get(f"{item['inst']}|volboard")
+                if last and now_ms - int(last) < VOLBOARD_COOLDOWN_MIN * 60 * 1000:
+                    continue
+                vol_hits.append((item, info))
+            vol_hits.sort(key=lambda x: x[1]["ratio"], reverse=True)
+            print(f"放量榜：命中 {len(vol_hits)} 个币")
+            parts = []
+            for rank_, (item, info) in enumerate(vol_hits[:VOLBOARD_MAX_PUSH], 1):
+                parts.append(fmt_volume(rank_, item, info, get_funding(item["inst"]), now_ms))
+                time.sleep(0.1)
+                state["last_alert"][f"{item['inst']}|volboard"] = str(now_ms)
+            if parts:
+                push_to_dingtalk("合约放量榜提醒", "\n\n———\n\n".join(parts))
 
     for direction, board, hist_key, title in (
         ("up", up, "hist_up", "合约涨幅榜提醒【偏多】"),
