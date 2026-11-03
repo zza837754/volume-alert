@@ -19,6 +19,8 @@ OKX 永续合约 涨幅榜 / 跌幅榜 监控
           持续拉升、连续下跌的币也能抓到
   4) 效果复盘：每条推送（D/F/C）都会记下方向和价格，1 小时、4 小时后自动回头看涨跌，
      每天早上 REPORT_HOUR_BJ 点推一份复盘，告诉你每种触发的真实胜率，用来调参数
+       H. 暴涨见顶后反弹做空（默认开启）：24 小时大涨的币里，找"暴涨 100%+ → 从高点回落 20%+ → 反弹没创新高、
+          在 MA25/MA99/50% 回撤位受阻 → 出现确认阴线"的，提示做空
   3) A/B 同一个币同一方向 COOLDOWN_MIN 分钟内只推一次；C 同一次形态只推一次
 
 说明：
@@ -65,6 +67,24 @@ ENABLE_EARLY_TRIGGER = True     # D：早期异动
 
 ENABLE_VOLUME_BOARD = True      # E：放量榜（成交额先放大，价格还没动）
 ENABLE_RAPID_TRIGGER = True     # F：急速拉升 / 急速下跌
+ENABLE_PUMPDUMP_SHORT = True    # H：暴涨见顶后反弹做空
+
+# --- H：暴涨见顶后反弹做空（15 分钟线）---
+PD_MIN_CHANGE_24H = 0.25        # 先从 24 小时涨幅 >= 25% 的币里找（暴涨后回落 30%，24 小时涨幅通常还在这个水平以上）
+PD_BASE_BARS = 100              # 暴涨起点：高点之前 100 根里的最低价
+PD_PUMP_MIN = 1.0               # 暴涨幅度（起点→高点）至少 100%；想抓小一点的，调成 0.5
+PD_DROP_MIN = 0.20              # 从高点回落至少 20%
+PD_DROP_MAX = 0.65              # 回落超过 65% 就算崩盘了，不做反弹
+PD_BOUNCE_MIN = 0.06            # 回落之后反弹至少 6%（相对回落低点）
+PD_RETRACE_MIN = 0.20           # 反弹收回的跌幅比例：20%～75%
+PD_RETRACE_MAX = 0.75
+PD_LOWER_HIGH = 0.05            # 反弹高点至少比暴涨高点低 5%（没有创新高）
+PD_RES_TOL = 0.015              # 反弹高点要落在阻力位附近（MA25、MA99、跌幅的 50% 或 61.8% 回撤位，相差 1.5% 以内）
+PD_MAX_BARS_AFTER_BOUNCE = 3    # 反弹高点之后 3 根内出现确认阴线
+PD_RISK_MAX = 0.08              # 止损（反弹高点上方）距离最大 8%
+PD_MIN_RR = 1.5                 # 到"等幅下跌目标"的盈亏比至少 1.5
+PD_FUNDING_MIN = -0.0010        # 资金费率低于 -0.10%（空头太拥挤，容易被逼空）不推
+PD_MAX_PUSH = 5
 
 # --- F：急速拉升 / 急速下跌（5 分钟线）---
 RAPID_MOVE_5M = 0.03            # 最近 1 根 5 分钟线涨/跌 >= 3%
@@ -95,16 +115,20 @@ PUMP_BASE_BARS = 60             # 拉升起点：峰值之前 60 根里的最低
 PEAK_SEARCH = 90                # 往回找峰值的范围（根）
 PEAK_MIN_AGO = 6                # 峰值至少在 6 根之前
 RETRACE_MIN = 0.20              # 回调幅度占整波的比例：20%～75%
-RETRACE_MAX = 0.75
+RETRACE_MAX = 0.55                # 回调不能超过整波的 55%（回调越深，说明买盘越弱；复盘里亏的那几条回调都超过了一半）
 RESTART_CROSS_BARS = 4          # 最近 4 根内重新站上 MA25
 RESTART_VOL_BASE_BARS = 8       # 成交量对比：回调整理期（再往前 8 根）
-RESTART_VOL_RATIO = 1.0         # 站上时的成交量 >= 整理期均量 * 该倍数
+RESTART_VOL_RATIO = 1.3         # 站上时的成交量 >= 整理期均量 * 该倍数（要明显放量）
 RESTART_MA7_TOL = 0.02          # MA7 不能比 MA25 低超过 2%
 RESTART_MAX_EXT = 0.06          # 现价离 MA25 超过 6% 不推（别追）
 # 形态信号只给"现在正在大幅异动"的币（像 ARIA 那种），已经走完、成交量枯竭的币不推
 SHAPE_MIN_CHANGE_24H = 0.20     # 24小时涨幅（跌幅榜则是跌幅）至少 20%
 SHAPE_MIN_MOVE_1H = 0.005       # 近1小时同方向至少 0.5%（回调再启动正在往上走，而不是还在掉头）
-SHAPE_MIN_VOL_BOOST = 1.0       # 近1小时成交额 >= 日均每小时的 1 倍（量能没有枯竭）
+SHAPE_MIN_VOL_BOOST = 1.2       # 近1小时成交额 >= 日均每小时的 1.2 倍（量能没有枯竭）
+SHAPE_REQUIRE_BREAKOUT = True   # 现价必须突破"站上MA25之前整理期"的最高点，只站上均线不够
+SHAPE_REQUIRE_HTF = True        # 1 小时趋势必须同向：做多要求 1H 收盘在 MA25 上方且 MA25 上行（做空反过来）
+SHAPE_BTC_FILTER = True         # BTC 逆势时不推：做多时 BTC 近 1 小时跌超 1%、做空时涨超 1% 就跳过
+SHAPE_BTC_BLOCK = 0.01
 SHAPE_COOLDOWN_MIN = 720        # 同一个币同一方向，形态信号 12 小时内只推一次
 SHAPE_SAME_PEAK_TOL = 0.003     # 高点（低点）相差不到 0.3% 视为同一波，同一波永远只推一次
 
@@ -285,7 +309,7 @@ def fmt_px(x):
 
 
 # ---------- 效果复盘 ----------
-KIND_NAMES = {"early": "早期异动", "rapid": "急速拉升/下跌", "shape": "回调再启动形态"}
+KIND_NAMES = {"early": "早期异动", "rapid": "急速拉升/下跌", "shape": "回调再启动形态", "pdshort": "暴涨见顶做空"}
 
 
 def log_signal(state, inst, kind, direction, price, now_ms):
@@ -323,6 +347,10 @@ def build_report(state, now_ms):
         if r4:
             part += f"｜4小时 胜率 {sum(1 for v in r4 if v > 0)/len(r4)*100:.0f}%（平均 {sum(r4)/len(r4)*100:+.2f}%，{len(r4)}条）"
         lines.append(part)
+        if len(rows) <= 8:                                   # 样本少的时候，把每条信号列出来，方便看是哪些币、怎么亏的
+            for x in rows:
+                f = lambda v: "待定" if v is None else f"{v*100:+.1f}%"
+                lines.append(f"    · {x['inst'].replace('-SWAP', '')} {'做多' if x['dir'] == 'up' else '做空'}｜入场 {fmt_px(x['entry'])}｜1小时 {f(x['r1'])}｜4小时 {f(x['r4'])}")
         for d, dn in (("up", "做多"), ("down", "做空")):
             rr = [x["r1"] for x in rows if x["dir"] == d and x["r1"] is not None]
             if rr:
@@ -346,6 +374,36 @@ def maybe_report(state, now_ms):
         push_to_dingtalk("合约信号复盘", text)
     else:
         print("复盘：还没有到期的信号，暂不推送")
+
+
+def htf_trend(inst):
+    """1 小时趋势：+1 向上（收盘在 MA25 上方且 MA25 上行）/ -1 向下 / 0 震荡；取不到返回 None（不拦截）"""
+    try:
+        ks = [k for k in get_klines(inst, "1H", 130) if k[8] == "1"]
+        c = [float(k[4]) for k in ks]
+        i = len(c) - 1
+        m25, m25_4 = ma(c, 25, i), ma(c, 25, i - 4)
+        if None in (m25, m25_4):
+            return None
+        if c[i] > m25 and m25 > m25_4:
+            return 1
+        if c[i] < m25 and m25 < m25_4:
+            return -1
+        return 0
+    except Exception as e:
+        print(f"{inst} 1H趋势获取失败: {e}", file=sys.stderr)
+        return None
+
+
+def btc_move_1h():
+    """BTC 近 1 小时涨跌幅，取不到返回 None"""
+    try:
+        ks = [k for k in get_klines("BTC-USDT-SWAP", "5m", 20) if k[8] == "1"]
+        c = [float(k[4]) for k in ks]
+        return c[-1] / c[-13] - 1
+    except Exception as e:
+        print(f"BTC 行情获取失败: {e}", file=sys.stderr)
+        return None
 
 
 def fmt_time(ms):
@@ -409,6 +467,8 @@ def _restart_up(klines):
             cross = j
             break
     if cross is None:
+        return None
+    if SHAPE_REQUIRE_BREAKOUT and c[i] <= max(h[max(0, cross - 8):cross]):     # 还没突破整理期的高点，只是站上了均线
         return None
 
     prev_vol = sum(v[i - RESTART_CROSS_BARS - RESTART_VOL_BASE_BARS + 1:i - RESTART_CROSS_BARS + 1]) / RESTART_VOL_BASE_BARS
@@ -534,6 +594,88 @@ def detect_rapid(klines):
             "price": c[-1], "level": hi1h if direction == "up" else lo1h}
 
 
+# ---------- H：暴涨见顶后反弹做空 ----------
+def detect_pump_dump_short(klines):
+    """暴涨 -> 见顶回落 -> 反弹受阻 -> 确认阴线。命中返回 dict，否则 None"""
+    n = len(klines)
+    if n < 130:
+        return None
+    o = [float(k[1]) for k in klines]
+    h = [float(k[2]) for k in klines]
+    l = [float(k[3]) for k in klines]
+    c = [float(k[4]) for k in klines]
+    i = n - 1
+
+    pk = max(range(max(0, i - PEAK_SEARCH), i - PEAK_MIN_AGO + 1), key=lambda x: h[x])     # 暴涨高点
+    peak = h[pk]
+    base = min(l[max(0, pk - PD_BASE_BARS):pk + 1])
+    if base <= 0 or (peak - base) / base < PD_PUMP_MIN:
+        return None
+
+    tr = min(range(pk, i + 1), key=lambda x: l[x])                                          # 回落低点
+    trough = l[tr]
+    drop = (peak - trough) / peak
+    if not (PD_DROP_MIN <= drop <= PD_DROP_MAX) or i - tr < 2:
+        return None
+
+    bo = max(range(tr + 1, i + 1), key=lambda x: h[x])                                      # 反弹高点
+    bounce_high = h[bo]
+    if (bounce_high - trough) / trough < PD_BOUNCE_MIN:
+        return None
+    retrace = (bounce_high - trough) / (peak - trough)
+    if not (PD_RETRACE_MIN <= retrace <= PD_RETRACE_MAX):
+        return None
+    if bounce_high > peak * (1 - PD_LOWER_HIGH):                                            # 必须是更低的高点
+        return None
+
+    # 反弹要在阻力位附近受阻：MA25、MA99、跌幅的 50% / 61.8% 回撤位
+    levels = {"MA25": ma(c, 25, bo), "MA99": ma(c, 99, bo),
+              "50%回撤位": trough + 0.5 * (peak - trough), "61.8%回撤位": trough + 0.618 * (peak - trough)}
+    hit = [(name, lv) for name, lv in levels.items() if lv and abs(bounce_high - lv) / lv <= PD_RES_TOL]
+    if not hit:
+        return None
+
+    # 确认：反弹高点之后 1~PD_MAX_BARS_AFTER_BOUNCE 根内，出现阴线，收盘低于上一根收盘，并且跌破 MA7 或上一根最低价
+    m7 = ma(c, 7, i)
+    if not (1 <= i - bo <= PD_MAX_BARS_AFTER_BOUNCE):
+        return None
+    if not (c[i] < o[i] and c[i] < c[i - 1] and (c[i] < m7 or c[i] < l[i - 1])):
+        return None
+
+    stop = bounce_high * 1.003
+    risk = (stop - c[i]) / c[i]
+    if not (0.003 <= risk <= PD_RISK_MAX):
+        return None
+    t1, t2 = trough, trough - (bounce_high - trough)                                          # 目标1：前低；目标2：等幅下跌
+    if c[i] <= t1:
+        return None
+    rr1, rr2 = (c[i] - t1) / (stop - c[i]), (c[i] - t2) / (stop - c[i])
+    if rr2 < PD_MIN_RR:
+        return None
+    return {"key_ts": klines[pk][0], "ts": klines[i][0], "price": c[i], "stop": stop, "risk": risk,
+            "peak": peak, "base": base, "pump_pct": (peak - base) / base, "trough": trough, "drop_pct": drop,
+            "bounce_high": bounce_high, "bounce_pct": (bounce_high - trough) / trough, "retrace": retrace,
+            "res": "、".join(f"{nm} {fmt_px(lv)}" for nm, lv in hit),
+            "target1": t1, "target2": t2, "rr1": rr1, "rr2": rr2, "bars_after": i - bo}
+
+
+def fmt_pumpdump(item, r, funding, now_ms):
+    lines = [
+        f"📉 做空  暴涨见顶后反弹受阻  {item['inst'].replace('-SWAP', '')}（15m）",
+        f"时间 {fmt_time(now_ms)}（北京时间）",
+        f"暴涨 +{r['pump_pct']*100:.0f}%（{fmt_px(r['base'])} → {fmt_px(r['peak'])}），回落 -{r['drop_pct']*100:.0f}% 到 {fmt_px(r['trough'])}，"
+        f"反弹 +{r['bounce_pct']*100:.0f}% 到 {fmt_px(r['bounce_high'])}（收回 {r['retrace']*100:.0f}% 的跌幅，没有创新高）",
+        f"反弹受阻位置：{r['res']}；确认阴线收盘时间 {fmt_time(int(r['ts']) + 15 * 60 * 1000)}",
+        f"参考入场价 {fmt_px(r['price'])}，止损 {fmt_px(r['stop'])}（距离 {r['risk']*100:.1f}%）",
+        f"目标1 {fmt_px(r['target1'])}（前低，盈亏比 {r['rr1']:.1f}），目标2 {fmt_px(r['target2'])}（等幅下跌，盈亏比 {r['rr2']:.1f}）",
+        f"24h {item['chg']*100:+.1f}%，24h成交额 {item['turnover']/1e6:.0f}M USDT",
+    ]
+    if funding is not None:
+        lines.append(f"资金费率 {funding*100:+.3f}%")
+    lines.append("提示：暴涨币反弹容易被逼空，止损务必执行。")
+    return "\n".join(lines)
+
+
 def fmt_rapid(item, r, rank_txt, funding, now_ms):
     up = r["direction"] == "up"
     lines = [
@@ -635,6 +777,7 @@ def main():
     print(f"读取状态：涨幅榜快照 {len(state.get('hist_up', []))} 份，跌幅榜快照 {len(state.get('hist_down', []))} 份，"
           f"已推过的形态 {len(state['shape_seen'])} 个，冷却记录 {len(state['last_alert'])} 个")
 
+    btc_cache = {"v": None}
     up, down, universe = build_rankings()
     if ENABLE_TRACKING:
         update_signals(state, {r["inst"]: r["last"] for r in universe}, now_ms)
@@ -743,6 +886,44 @@ def main():
             if parts:
                 push_to_dingtalk("合约放量榜提醒", "\n\n———\n\n".join(parts))
 
+    # ---- H：暴涨见顶后反弹做空 ----
+    if ENABLE_PUMPDUMP_SHORT:
+        pumped = sorted([r for r in universe if r["chg"] >= PD_MIN_CHANGE_24H], key=lambda r: r["chg"], reverse=True)[:40]
+        pd_hits = []
+        for item in pumped:
+            try:
+                ks = [k for k in get_klines(item["inst"], "15m", 150) if k[8] == "1"]
+                r = detect_pump_dump_short(ks)
+            except Exception as e:
+                print(f"{item['inst']} 暴涨见顶检测失败: {e}", file=sys.stderr)
+                r = None
+            time.sleep(0.15)
+            if not r:
+                continue
+            key = f"{item['inst']}|pdshort"
+            if not shape_is_new(state, key, {"key_ts": r["key_ts"], "extreme": r["peak"]}, now_ms):      # 同一个暴涨高点 12 小时内只推一次
+                continue
+            if SHAPE_BTC_FILTER:
+                if btc_cache["v"] is None:
+                    btc_cache["v"] = btc_move_1h()
+                if btc_cache["v"] is not None and btc_cache["v"] >= SHAPE_BTC_BLOCK:
+                    print(f"{item['inst']} 暴涨见顶形态成立但 BTC 近1小时 {btc_cache['v']*100:+.1f}% 在涨，做空逆势，跳过")
+                    continue
+            fr = get_funding(item["inst"])
+            time.sleep(0.1)
+            if fr is not None and fr <= PD_FUNDING_MIN:
+                print(f"{item['inst']} 暴涨见顶形态成立但资金费率 {fr*100:+.3f}% 空头太拥挤，容易逼空，跳过")
+                continue
+            pd_hits.append((item, r, fr))
+        print(f"暴涨见顶做空：检查 {len(pumped)} 个大涨的币，命中 {len(pd_hits)} 个")
+        parts = []
+        for item, r, fr in pd_hits[:PD_MAX_PUSH]:
+            parts.append(fmt_pumpdump(item, r, fr, now_ms))
+            state["shape_seen"][f"{item['inst']}|pdshort"] = {"key_ts": str(r["key_ts"]), "peak": r["peak"], "at": now_ms}
+            log_signal(state, item["inst"], "pdshort", "down", r["price"], now_ms)
+        if parts:
+            push_to_dingtalk("合约暴涨见顶做空提醒【偏空】", "\n\n———\n\n".join(parts))
+
     for direction, board, hist_key, title in (
         ("up", up, "hist_up", "合约涨幅榜提醒【偏多】"),
         ("down", down, "hist_down", "合约跌幅榜提醒【偏空】"),
@@ -801,6 +982,19 @@ def main():
                     move_ok = bool(mom) and (mom[0] >= SHAPE_MIN_MOVE_1H if direction == "up" else mom[0] <= -SHAPE_MIN_MOVE_1H)
                     if not (move_ok and mom[1] >= SHAPE_MIN_VOL_BOOST):
                         print(f"{inst} 形态成立但动量/量能不足，跳过（近1小时 {mom[0]*100:+.1f}%，量能 {mom[1]:.1f} 倍）" if mom else f"{inst} 形态成立但取不到动量，跳过")
+                        sh = None
+                if sh and SHAPE_REQUIRE_HTF:                        # 1 小时趋势要同向
+                    t1h = htf_trend(inst)
+                    time.sleep(0.15)
+                    if t1h is not None and t1h != (1 if direction == "up" else -1):
+                        print(f"{inst} 形态成立但 1H 趋势{'向上' if t1h == 1 else '向下' if t1h == -1 else '震荡'}，与{'做多' if direction == 'up' else '做空'}不一致，跳过")
+                        sh = None
+                if sh and SHAPE_BTC_FILTER:                         # BTC 不能逆势
+                    if btc_cache["v"] is None:
+                        btc_cache["v"] = btc_move_1h()
+                    b = btc_cache["v"]
+                    if b is not None and ((direction == "up" and b <= -SHAPE_BTC_BLOCK) or (direction == "down" and b >= SHAPE_BTC_BLOCK)):
+                        print(f"{inst} 形态成立但 BTC 近1小时 {b*100:+.1f}% 逆势，跳过")
                         sh = None
                 if sh:
                     shape_key = f"{inst}|{direction}"
