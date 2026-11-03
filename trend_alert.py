@@ -11,8 +11,9 @@ BTC / ETH 顺势单提醒（OKX 永续合约）
        📍 到位提醒：趋势明确，价格刚回踩到 MA25 附近（还没出确认K线），提醒你盯盘
        ✅ 确认信号：回踩触及 MA25 附近、没有跌破 MA99，随后出现收盘越过上一根极值的反转K线，
                     并给出参考入场价、止损、两个目标位（前高/前低、等幅延伸），到等幅目标的盈亏比不够 1.5 的不推
-  3) 默认监控四组：BTC 15 分钟（看 1H 趋势）、ETH 15 分钟（看 1H 趋势）、
+  3) 默认监控四组：BTC 15 分钟（看 30 分钟趋势）、ETH 15 分钟（看 30 分钟趋势）、
                     BTC 1 小时（看 4H 趋势）、ETH 1 小时（看 4H 趋势）
+     消息里还会同时列出 1H、4H 的趋势作参考（不参与过滤）
 
 说明：这是顺势回踩的经典做法，但并不保证胜率；请把止损位当成必须执行的保护，不要无止损持仓。
 独立文件，不依赖其他脚本。环境变量 DINGTALK_WEBHOOK_TREND（或 DINGTALK_WEBHOOK）不设置时只打印不推送。
@@ -29,9 +30,11 @@ import requests
 
 # ========== 可调参数 ==========
 # (合约, 入场周期, 大周期)
+# 15 分钟入场看 30 分钟趋势：比看 1 小时反应快（趋势确认和转向都更早），代价是趋势更容易反复。
+# 想更稳就把 "30m" 改回 "1H"。
 TARGETS = [
-    ("BTC-USDT-SWAP", "15m", "1H"),
-    ("ETH-USDT-SWAP", "15m", "1H"),
+    ("BTC-USDT-SWAP", "15m", "30m"),
+    ("ETH-USDT-SWAP", "15m", "30m"),
     ("BTC-USDT-SWAP", "1H", "4H"),
     ("ETH-USDT-SWAP", "1H", "4H"),
 ]
@@ -93,6 +96,8 @@ def get_funding(inst):
 
 def push_to_dingtalk(title, content):
     webhook = os.environ.get("DINGTALK_WEBHOOK_TREND") or os.environ.get("DINGTALK_WEBHOOK")
+    if webhook:
+        print("发送到：" + ("专用群（DINGTALK_WEBHOOK_TREND）" if os.environ.get("DINGTALK_WEBHOOK_TREND") else "默认群（DINGTALK_WEBHOOK，没有设置专用群地址）"))
     if not webhook:
         print("未设置 DINGTALK_WEBHOOK_TREND / DINGTALK_WEBHOOK，仅打印：")
         print(title)
@@ -221,14 +226,14 @@ def convert_short(r, klines):
 TREND_TXT = {1: "向上", -1: "向下", 0: "震荡", None: "未知"}
 
 
-def fmt_alert(inst, bar, htf, side, r, trend_htf, trend_4h, funding):
+def fmt_alert(inst, bar, htf, side, r, trend_htf, ctx, funding):
     long_ = side == "long"
     name = inst.replace("-SWAP", "")
     kind_txt = "✅确认信号" if r["kind"] == "confirm" else "📍回踩到位（等确认）"
     lines = [
         f"{'📈 做多' if long_ else '📉 做空'}  顺势{'回踩' if long_ else '反弹'}  {name}（{bar}）  {kind_txt}",
         f"时间 {fmt_time(r['ts'])}（北京时间，K线收盘）",
-        f"大周期趋势：{htf} {TREND_TXT[trend_htf]}" + (f"；4H {TREND_TXT[trend_4h]}" if htf != "4H" else ""),
+        f"大周期趋势：{htf} {TREND_TXT[trend_htf]}" + "".join(f"；{b} {TREND_TXT[t]}" for b, t in ctx.items()),
         f"{'回踩' if long_ else '反弹'}到 {bar} MA25（{fmt_px(r['ma25'])}）附近，MA99 {fmt_px(r['ma99'])}，"
         f"{'前高' if long_ else '前低'} {fmt_px(r['sh'])}，{'回踩低点' if long_ else '反弹高点'} {fmt_px(r['pb_low'])}",
     ]
@@ -245,9 +250,15 @@ def fmt_alert(inst, bar, htf, side, r, trend_htf, trend_4h, funding):
 
 
 def main():
+    now_ms = int(time.time() * 1000)
+    if "--test" in sys.argv:       # 手动测试：只发一条测试消息，不扫描、不改状态
+        push_to_dingtalk("合约顺势单提醒（测试消息）",
+                         f"时间 {fmt_time(now_ms)}（北京时间）\n这是一条测试消息，用来确认钉钉群的 Webhook 配置正确。\n"
+                         "如果你在目标群里看到了它，说明顺势单的推送通道没问题；之后有回踩信号才会推送真正的提醒。")
+        return
+
     state = load_state()
     state.setdefault("last_alert", {})
-    now_ms = int(time.time() * 1000)
 
     cache = {}
 
@@ -262,7 +273,9 @@ def main():
         try:
             ks = klines(inst, bar)
             trend = trend_of(klines(inst, htf, 130))
-            trend_4h = trend if htf == "4H" else trend_of(klines(inst, "4H", 130))
+            order = ["15m", "30m", "1H", "4H"]
+            ctx = {b: trend_of(klines(inst, b, 130)) for b in ("1H", "4H")      # 比"趋势周期"更大的周期，只显示，不过滤
+                   if order.index(b) > order.index(htf)}
         except Exception as e:
             print(f"{inst} {bar} 数据获取失败: {e}", file=sys.stderr)
             continue
@@ -288,7 +301,7 @@ def main():
                 now_ms - int(state["last_alert"][f"{inst}|{bar}|{side}|confirm"]) < cd * 60 * 1000:
             continue
 
-        parts.append(fmt_alert(inst, bar, htf, side, r, trend, trend_4h, get_funding(inst)))
+        parts.append(fmt_alert(inst, bar, htf, side, r, trend, ctx, get_funding(inst)))
         state["last_alert"][key] = str(now_ms)
         time.sleep(0.1)
 
