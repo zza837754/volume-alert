@@ -15,7 +15,11 @@ BTC / ETH 顺势单提醒（OKX 永续合约）
                     BTC 1 小时（看 4H 趋势）、ETH 1 小时（看 4H 趋势）
      消息里还会同时列出 1H、4H 的趋势作参考（不参与过滤）
 
-说明：这是顺势回踩的经典做法，但并不保证胜率；请把止损位当成必须执行的保护，不要无止损持仓。
+自动复盘：每条确认信号都会记下入场价、止损、目标位，之后用 15 分钟线判断先碰到止损还是先碰到目标，
+每天北京时间 REPORT_HOUR_BJ 点推一份复盘（胜率、合计多少 R），让你看到它的真实表现。
+
+说明：这是顺势回踩的经典做法，但并不保证胜率；来回震荡、V 型反转的行情里它会连续止损。
+请把止损位当成必须执行的保护，不要无止损持仓。
 独立文件，不依赖其他脚本。环境变量 DINGTALK_WEBHOOK_TREND（或 DINGTALK_WEBHOOK）不设置时只打印不推送。
 """
 
@@ -30,14 +34,17 @@ import requests
 
 # ========== 可调参数 ==========
 # (合约, 入场周期, 大周期)
-# 15 分钟入场看 30 分钟趋势：比看 1 小时反应快（趋势确认和转向都更早），代价是趋势更容易反复。
-# 想更稳就把 "30m" 改回 "1H"。
+# (合约, 入场周期, 趋势周期, 还必须同向的更大周期)
+# 复盘发现只靠 30 分钟趋势会被洗（30m 向上但 1H、4H 都是震荡时做多，随后下跌），所以 15 分钟入场要求
+# 30 分钟趋势 + 1 小时同向；1 小时入场要求 4 小时同向。
 TARGETS = [
-    ("BTC-USDT-SWAP", "15m", "30m"),
-    ("ETH-USDT-SWAP", "15m", "30m"),
-    ("BTC-USDT-SWAP", "1H", "4H"),
-    ("ETH-USDT-SWAP", "1H", "4H"),
+    ("BTC-USDT-SWAP", "15m", "30m", ["1H"]),
+    ("ETH-USDT-SWAP", "15m", "30m", ["1H"]),
+    ("BTC-USDT-SWAP", "1H", "4H", []),
+    ("ETH-USDT-SWAP", "1H", "4H", []),
 ]
+# 趋势强度：MA25 和 MA99 至少拉开多少，才算"有趋势"（两条线缠在一起就是震荡，不做）
+TREND_MIN_GAP = {"30m": 0.0015, "1H": 0.0025, "4H": 0.004}
 
 # 按入场周期设置：BTC/ETH 波动比山寨小，阈值要小得多
 PB_WIN = 8                                          # 回踩窗口：最近 8 根
@@ -51,7 +58,7 @@ MIN_RR = 1.5                                        # 到"等幅延伸目标"的
 
 CONFIRM_COOLDOWN_MIN = {"15m": 60, "1H": 360}       # 同一组、同一方向的确认信号冷却
 ZONE_COOLDOWN_MIN = {"15m": 45, "1H": 240}          # 到位提醒冷却
-ENABLE_ZONE_ALERT = True                            # 是否推送"到位提醒"
+ENABLE_ZONE_ALERT = False                           # "到位提醒"只是提前打招呼，没有确认，容易遇到反转，默认关闭；想要就改成 True
 STATE_FILE = "trend_state.json"
 DINGTALK_SECURITY_KEYWORD = "合约"                   # 要和钉钉机器人"自定义关键词"一致
 # ==============================
@@ -116,7 +123,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"last_alert": {}}
+    return {"last_alert": {}, "signals": [], "last_report_date": ""}
 
 
 def save_state(state):
@@ -137,16 +144,17 @@ def invert(klines):
 
 
 # ---------- 趋势与入场 ----------
-def trend_of(klines):
-    """大周期趋势：+1 向上 / -1 向下 / 0 震荡；数据不够返回 None"""
+def trend_of(klines, bar):
+    """趋势：+1 向上 / -1 向下 / 0 震荡（含"方向对但 MA25 与 MA99 没拉开"）；数据不够返回 None"""
     c = [float(k[4]) for k in klines]
     i = len(c) - 1
     m25, m99, m25_4 = ma(c, 25, i), ma(c, 99, i), ma(c, 25, i - 4)
     if None in (m25, m99, m25_4):
         return None
-    if c[i] > m25 > m99 and m25 > m25_4:
+    gap = TREND_MIN_GAP.get(bar, 0.0)
+    if c[i] > m25 > m99 and m25 > m25_4 and (m25 - m99) / m99 >= gap:
         return 1
-    if c[i] < m25 < m99 and m25 < m25_4:
+    if c[i] < m25 < m99 and m25 < m25_4 and (m99 - m25) / m99 >= gap:
         return -1
     return 0
 
@@ -222,6 +230,88 @@ def convert_short(r, klines):
     return out
 
 
+# ---------- 自动复盘 ----------
+REPORT_HOUR_BJ = 9              # 每天北京时间几点之后推送复盘（只推一次）
+TRACK_KEEP_HOURS = 72           # 信号记录保留多久
+GIVE_UP_HOURS = 48              # 超过这么久既没碰止损也没碰目标，记为"未触及"
+
+
+def log_signal(state, inst, bar, side, r, now_ms):
+    state["signals"].append({"inst": inst, "bar": bar, "side": side, "ts": r["ts"], "at": now_ms, "entry": r["price"],
+                             "stop": r["stop"], "t1": r["target1"], "t2": r["target2"],
+                             "rr1": r["rr1"], "rr2": r["rr2"], "res": None})
+
+
+def evaluate_signals(state, kl, now_ms):
+    """用推送之后的 15 分钟线判断：先碰止损（-1R）、还是先碰目标1（+rr1）/目标2（+rr2）。同一根K线两边都碰到，算止损"""
+    for sig in state["signals"]:
+        if sig["res"] is not None:
+            continue
+        try:
+            ks = kl(sig["inst"], "15m", 200)
+        except Exception as e:
+            print(f"{sig['inst']} 复盘取K线失败: {e}", file=sys.stderr)
+            continue
+        for k in ks:
+            if int(k[0]) <= int(sig["ts"]):
+                continue
+            hi, lo = float(k[2]), float(k[3])
+            if sig["side"] == "long":
+                stop_hit, t2_hit, t1_hit = lo <= sig["stop"], hi >= sig["t2"], hi >= sig["t1"]
+            else:
+                stop_hit, t2_hit, t1_hit = hi >= sig["stop"], lo <= sig["t2"], lo <= sig["t1"]
+            if stop_hit:
+                sig["res"] = "stop"
+            elif t2_hit:
+                sig["res"] = "t2"
+            elif t1_hit:
+                sig["res"] = "t1"
+            if sig["res"]:
+                break
+        if sig["res"] is None and (now_ms - sig["at"]) / 3600000 >= GIVE_UP_HOURS:
+            sig["res"] = "none"
+    state["signals"] = [x for x in state["signals"] if (now_ms - x["at"]) / 3600000 <= TRACK_KEEP_HOURS]
+
+
+def build_report(state, now_ms):
+    rows = state["signals"]
+    if not rows:
+        return None
+    names = {"stop": "止损", "t1": "到目标1", "t2": "到目标2", "none": "未触及", None: "进行中"}
+    cnt = {k: sum(1 for x in rows if x["res"] == k) for k in names}
+    done = [x for x in rows if x["res"] in ("stop", "t1", "t2")]
+    lines = [f"时间 {fmt_time(now_ms)}（北京时间）",
+             f"近{TRACK_KEEP_HOURS//24}天确认信号共 {len(rows)} 条：到目标1 {cnt['t1']+cnt['t2']} 条（含目标2 {cnt['t2']} 条）｜止损 {cnt['stop']} 条｜"
+             f"进行中 {cnt[None]} 条｜48小时未触及 {cnt['none']} 条"]
+    if done:
+        total_r = sum(-1.0 if x["res"] == "stop" else x["rr1"] if x["res"] == "t1" else x["rr2"] for x in done)
+        wins = sum(1 for x in done if x["res"] != "stop")
+        lines.append(f"已出结果 {len(done)} 条：胜率 {wins/len(done)*100:.0f}%，合计 {total_r:+.1f}R（止损记 -1R，到目标1 记其盈亏比，到目标2 记其盈亏比）")
+        for side, nm in (("long", "做多"), ("short", "做空")):
+            d = [x for x in done if x["side"] == side]
+            if d:
+                lines.append(f"    └ {nm}：{len(d)} 条，胜率 {sum(1 for x in d if x['res'] != 'stop')/len(d)*100:.0f}%")
+    if len(rows) <= 10:
+        for x in rows:
+            lines.append(f"    · {x['inst'].split('-')[0]} {'做多' if x['side'] == 'long' else '做空'} {x['bar']} {fmt_time(x['at'])} "
+                         f"入场 {fmt_px(x['entry'])} → {names[x['res']]}")
+    lines.append("说明：只按止损和目标位谁先碰到来判断，不含手续费；样本少于 30 条时仅供参考。")
+    return "\n".join(lines)
+
+
+def maybe_report(state, now_ms):
+    bj = datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc) + datetime.timedelta(hours=8)
+    today = bj.strftime("%Y-%m-%d")
+    if bj.hour < REPORT_HOUR_BJ or state.get("last_report_date") == today:
+        return
+    state["last_report_date"] = today
+    text = build_report(state, now_ms)
+    if text:
+        push_to_dingtalk("合约顺势单复盘", text)
+    else:
+        print("复盘：还没有信号记录，暂不推送")
+
+
 # ---------- 消息 ----------
 TREND_TXT = {1: "向上", -1: "向下", 0: "震荡", None: "未知"}
 
@@ -259,6 +349,9 @@ def main():
 
     state = load_state()
     state.setdefault("last_alert", {})
+    state.setdefault("signals", [])
+    state.setdefault("last_report_date", "")
+    print(f"读取状态：{len(state['last_alert'])} 条冷却记录，{len(state['signals'])} 条待复盘信号")
 
     cache = {}
 
@@ -268,14 +361,17 @@ def main():
             time.sleep(0.25)
         return cache[(inst, bar)]
 
+    evaluate_signals(state, klines, now_ms)
+
     parts = []
-    for inst, bar, htf in TARGETS:
+    for inst, bar, htf, align in TARGETS:
         try:
             ks = klines(inst, bar)
-            trend = trend_of(klines(inst, htf, 130))
+            trend = trend_of(klines(inst, htf, 130), htf)
             order = ["15m", "30m", "1H", "4H"]
-            ctx = {b: trend_of(klines(inst, b, 130)) for b in ("1H", "4H")      # 比"趋势周期"更大的周期，只显示，不过滤
+            ctx = {b: trend_of(klines(inst, b, 130), b) for b in ("1H", "4H")      # 比"趋势周期"更大的周期，显示出来
                    if order.index(b) > order.index(htf)}
+            align_trends = {b: (ctx[b] if b in ctx else trend_of(klines(inst, b, 130), b)) for b in align}
         except Exception as e:
             print(f"{inst} {bar} 数据获取失败: {e}", file=sys.stderr)
             continue
@@ -283,6 +379,11 @@ def main():
             print(f"{inst} {bar}：{htf} 趋势{TREND_TXT[trend]}，不推送")
             continue
         side = "long" if trend == 1 else "short"
+        want = 1 if side == "long" else -1
+        bad = [b for b, t in align_trends.items() if t != want]
+        if bad:
+            print(f"{inst} {bar}：{htf} 趋势{TREND_TXT[trend]}，但 {'、'.join(bad)} 趋势不同向（{', '.join(TREND_TXT[align_trends[b]] for b in bad)}），不推送")
+            continue
         r = analyze(ks if side == "long" else invert(ks), bar)
         if not r:
             print(f"{inst} {bar}：{htf} 趋势{TREND_TXT[trend]}，但没有回踩到位/确认信号")
@@ -303,6 +404,8 @@ def main():
 
         parts.append(fmt_alert(inst, bar, htf, side, r, trend, ctx, get_funding(inst)))
         state["last_alert"][key] = str(now_ms)
+        if r["kind"] == "confirm":
+            log_signal(state, inst, bar, side, r, now_ms)
         time.sleep(0.1)
 
     if parts:
@@ -310,6 +413,7 @@ def main():
     else:
         print("本次没有顺势信号。")
 
+    maybe_report(state, now_ms)
     state["last_alert"] = {k: v for k, v in state["last_alert"].items() if now_ms - int(v) < 3 * 24 * 3600 * 1000}
     save_state(state)
 
