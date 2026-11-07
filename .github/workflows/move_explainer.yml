@@ -1,10 +1,15 @@
 name: move_explainer
 on:
   workflow_dispatch:
+    inputs:
+      test:
+        description: "只发一条测试消息，不扫描"
+        type: boolean
+        default: false
 permissions:
   contents: write
 concurrency:
-  group: trend_alert
+  group: move_explainer
   cancel-in-progress: false
 jobs:
   run:
@@ -15,14 +20,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests
-      - run: python move_explainer.py
+      - run: python move_explainer.py ${{ inputs.test && '--test' || '' }}
         env:
-          DINGTALK_WEBHOOK_MOVE: ${{ secrets.DINGTALK_WEBHOOK_MOVE }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          DINGTALK_WEBHOOK_TREND: ${{ secrets.DINGTALK_WEBHOOK_TREND }}
+          DINGTALK_WEBHOOK_MOVE: ${{ secrets.DINGTALK_WEBHOOK_MOVE }}
       - run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add -A
-          git commit -m "update trend state" || true
+          git commit -m "update move state" || true
           for i in 1 2 3; do git pull --rebase && git push && break; sleep 3; done
