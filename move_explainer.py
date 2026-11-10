@@ -40,6 +40,11 @@ MAJOR_MOVE_60M = 0.020          # 或近 1 小时 >= 2%
 ALT_MOVE_15M = 0.030            # 其他币：近 15 分钟 >= 3%
 ALT_MOVE_60M = 0.060            # 或近 1 小时 >= 6%
 ALT_VOL_RATIO = 2.0             # 其他币还要求：最近 15 分钟成交额 >= 此前均值的 2 倍
+# 单根K线的"闪崩/插针"：涨跌幅按收盘价算会被快速反弹抵消，所以单独看最近 3 根 5 分钟线里振幅最大的一根
+MAJOR_SPIKE_RANGE = 0.020       # BTC/ETH：单根振幅（最高-最低）>= 2%
+ALT_SPIKE_RANGE = 0.060         # 其他币：单根振幅 >= 6%，并且这一根成交额是此前每根均值的 3 倍以上
+ALT_SPIKE_VOL = 3.0
+HEARTBEAT_HOUR_BJ = 9           # 每天北京时间几点之后推一份"运行报告"，让你知道脚本在跑、昨天看到了什么
 
 BREADTH_MOVE = 0.01             # 统计"同向"：近 1 小时涨跌超过 1% 的币
 BREADTH_MIN = 0.50              # 一半以上的币同向，就算大盘联动
@@ -188,24 +193,49 @@ def list_universe():
 
 
 def analyze_moves(ks):
-    """近 15 分钟/1 小时涨跌、放量倍数"""
+    """近 15 分钟/1 小时涨跌、放量倍数，以及最近 3 根里振幅最大的一根（闪崩/插针）"""
     if len(ks) < 40:
         return None
+    o = [float(k[1]) for k in ks]
+    h = [float(k[2]) for k in ks]
+    l = [float(k[3]) for k in ks]
     c = [float(k[4]) for k in ks]
     q = [float(k[7]) if float(k[7]) > 0 else float(k[6]) * float(k[4]) for k in ks]
     base = sum(q[-27:-3]) / 24 * 3
+    per_bar = base / 3
+    j = max(range(len(ks) - 3, len(ks)), key=lambda x: (h[x] - l[x]) / o[x])      # 最近 3 根里振幅最大的一根
     return {"move15": c[-1] / c[-4] - 1, "move60": c[-1] / c[-13] - 1, "price": c[-1],
-            "ratio": sum(q[-3:]) / base if base > 0 else 0.0}
+            "ratio": sum(q[-3:]) / base if base > 0 else 0.0,
+            "spike_rng": (h[j] - l[j]) / o[j], "spike_dir": "down" if c[j] < o[j] else "up",
+            "spike_vol": q[j] / per_bar if per_bar > 0 else 0.0, "spike_ts": ks[j][0]}
+
+
+def spike_hit(coin, m):
+    if coin in MAJORS:
+        return m["spike_rng"] >= MAJOR_SPIKE_RANGE
+    return m["spike_rng"] >= ALT_SPIKE_RANGE and m["spike_vol"] >= ALT_SPIKE_VOL
 
 
 def is_mover(coin, m):
+    if spike_hit(coin, m):
+        return True
     if coin in MAJORS:
         return abs(m["move15"]) >= MAJOR_MOVE_15M or abs(m["move60"]) >= MAJOR_MOVE_60M
     return (abs(m["move15"]) >= ALT_MOVE_15M or abs(m["move60"]) >= ALT_MOVE_60M) and m["ratio"] >= ALT_VOL_RATIO
 
 
 def direction_of(m):
-    return "up" if (m["move15"] if abs(m["move15"]) >= 0.5 * abs(m["move60"]) else m["move60"]) > 0 else "down"
+    net = m["move15"] if abs(m["move15"]) >= 0.5 * abs(m["move60"]) else m["move60"]
+    if abs(net) < 0.5 * m["spike_rng"]:        # 净涨跌很小，但有一根很大的针：按那根针的方向算
+        return m["spike_dir"]
+    return "up" if net > 0 else "down"
+
+
+def spike_line(m):
+    if m["spike_rng"] < 0.02:
+        return None
+    return (f"单根5分钟K线（{fmt_time(m['spike_ts'])}）振幅 {m['spike_rng']*100:.1f}%，{'下砸' if m['spike_dir'] == 'down' else '急拉'}，"
+            f"成交额是此前每根均值的 {m['spike_vol']:.1f} 倍。急涨急跌之后常有回弹，先看是不是插针")
 
 
 # ---------- 线索：新闻、公告 ----------
@@ -374,6 +404,9 @@ def fmt_market(direction, btc, eth, breadth_up, breadth_down, movers, news, liq_
     ]
     if eth:
         lines.append(f"ETH 近15分钟 {eth['move15']*100:+.1f}%，近1小时 {eth['move60']*100:+.1f}%")
+    sl = spike_line(btc)
+    if sl:
+        lines.append(sl)
     lines.append(f"全市场：近1小时 {breadth_up*100:.0f}% 的币涨超1%、{breadth_down*100:.0f}% 的币跌超1%")
     if movers:
         lines.append(("领涨：" if up else "领跌：") + "，".join(f"{c} {v*100:+.1f}%" for c, v in movers))
@@ -395,6 +428,9 @@ def fmt_alt(item, m, direction, btc, breadth_same, news, liq, funding, now_ms):
         + (f"，资金费率 {funding*100:+.3f}%" if funding is not None else ""),
         f"大盘：BTC 近1小时 {btc['move60']*100:+.1f}%，全市场 {breadth_same*100:.0f}% 的币同向",
     ]
+    sl = spike_line(m)
+    if sl:
+        lines.insert(3, sl)
     lt = liq_text(liq)
     if lt:
         lines.append(lt)
@@ -414,6 +450,44 @@ def fmt_alt(item, m, direction, btc, breadth_same, news, liq, funding, now_ms):
     return "\n".join(lines)
 
 
+def maybe_heartbeat(state, now_ms, n_coins, by_coin):
+    """每天一份运行报告：脚本在不在跑、过去 24 小时检测到几次异动、哪些推送了、哪些没推（以及原因）"""
+    bj = datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc) + datetime.timedelta(hours=8)
+    today = bj.strftime("%Y-%m-%d")
+    if bj.hour < HEARTBEAT_HOUR_BJ or state.get("last_heartbeat") == today:
+        return
+    state["last_heartbeat"] = today
+    evs = sorted((e for e in state["events"] if now_ms - e["ts"] < 24 * 3600 * 1000), key=lambda e: e["ts"])
+    groups = []                                               # 同一个币同一方向，间隔不超过 60 分钟算同一次异动
+    for e in evs:
+        for g in groups:
+            if g["coin"] == e["coin"] and g["dir"] == e["dir"] and e["ts"] - g["last"] <= 60 * 60 * 1000:
+                g["last"] = e["ts"]
+                g["pushed"] = g["pushed"] or e["pushed"]
+                if max(abs(e["move15"]), e["spike"]) > g["size"]:
+                    g["size"], g["move15"], g["spike"] = max(abs(e["move15"]), e["spike"]), e["move15"], e["spike"]
+                if not e["pushed"] and e["why"]:
+                    g["why"] = e["why"]
+                break
+        else:
+            groups.append({"coin": e["coin"], "dir": e["dir"], "first": e["ts"], "last": e["ts"], "pushed": e["pushed"],
+                           "size": max(abs(e["move15"]), e["spike"]), "move15": e["move15"], "spike": e["spike"], "why": e["why"]})
+    lines = [f"时间 {fmt_time(now_ms)}（北京时间）", f"✅ 脚本运行正常，本次扫描 {n_coins} 个币。"]
+    for c in ("BTC", "ETH"):
+        if c in by_coin:
+            lines.append(f"{c} 24h {by_coin[c]['chg']*100:+.1f}%")
+    pushed = sum(1 for g in groups if g["pushed"])
+    lines.append(f"过去24小时共检测到 {len(groups)} 次异动，其中推送 {pushed} 次，没推 {len(groups) - pushed} 次。")
+    for g in sorted(groups, key=lambda g: g["size"], reverse=True)[:5]:
+        lines.append(f"  · {fmt_time(g['first'])} {g['coin']} {'下跌' if g['dir'] == 'down' else '上涨'}：近15分钟 {g['move15']*100:+.1f}%"
+                     + (f"，单根振幅 {g['spike']*100:.1f}%" if g["spike"] >= 0.02 else "")
+                     + ("（已推送）" if g["pushed"] else f"（没推：{g['why'] or '未知'}）"))
+    if not groups:
+        lines.append("过去24小时没有达到阈值的异动。")
+    lines.append("说明：如果你发现行情大涨大跌，这里却没有记录，说明脚本那段时间没跑成功，请看 GitHub Actions 的运行记录。")
+    push_to_dingtalk("合约异动归因（每日运行报告）", "\n".join(lines))
+
+
 def main():
     now_ms = int(time.time() * 1000)
     if "--test" in sys.argv:
@@ -424,7 +498,9 @@ def main():
 
     state = load_state()
     state.setdefault("last_alert", {})
-    print(f"读取状态：{len(state['last_alert'])} 条冷却记录")
+    state.setdefault("events", [])
+    state.setdefault("last_heartbeat", "")
+    print(f"读取状态：{len(state['last_alert'])} 条冷却记录，{len(state['events'])} 条异动记录")
 
     universe = list_universe()
     print(f"扫描 {len(universe)} 个币")
@@ -454,12 +530,17 @@ def main():
         return bool(last and now_ms - int(last) < minutes * 60 * 1000)
 
     parts = []
+    new_events = []
 
     # ① 大盘异动：BTC 触发阈值
     market_event = False
     if is_mover("BTC", btc):
         d = direction_of(btc)
+        btc_ev = {"ts": now_ms, "coin": "BTC", "dir": d, "move15": btc["move15"], "move60": btc["move60"],
+                  "spike": btc["spike_rng"], "pushed": False, "why": "冷却中"}
+        new_events.append(btc_ev)
         if not cooling(f"MARKET|{d}", MARKET_COOLDOWN_MIN):
+            btc_ev["pushed"], btc_ev["why"] = True, ""
             market_event = True
             ranked = sorted(((c, m["move60"]) for c, m in moves.items() if c not in ("BTC", "ETH")), key=lambda x: x[1], reverse=(d == "up"))[:3]
             liq_lines, liq_total = [], 0.0
@@ -480,14 +561,20 @@ def main():
         if coin == "BTC" or not is_mover(coin, m):
             continue
         d = direction_of(m)
+        ev = {"ts": now_ms, "coin": coin, "dir": d, "move15": m["move15"], "move60": m["move60"],
+              "spike": m["spike_rng"], "pushed": False, "why": ""}
+        new_events.append(ev)
         if market_event and abs(m["move60"] - btc["move60"]) < 0.03:       # 大盘异动期间，只推明显强于/弱于大盘的个币
+            ev["why"] = "跟随大盘，已并入大盘消息"
             continue
         if cooling(f"{it['inst']}|{d}", COOLDOWN_MIN):
+            ev["why"] = "冷却中"
             continue
-        alt_hits.append((it, m, d))
-    alt_hits.sort(key=lambda x: abs(x[1]["move15"]), reverse=True)
+        alt_hits.append((it, m, d, ev))
+    alt_hits.sort(key=lambda x: max(abs(x[1]["move15"]), x[1]["spike_rng"]), reverse=True)
     print(f"个币异动：命中 {len(alt_hits)} 个")
-    for it, m, d in alt_hits[:MAX_ALT_PUSH]:
+    for it, m, d, ev in alt_hits[:MAX_ALT_PUSH]:
+        ev["pushed"] = True
         liq = liquidations(it["coin"])
         time.sleep(0.45)
         same = b_up if d == "up" else b_down
@@ -498,6 +585,11 @@ def main():
         push_to_dingtalk("合约异动归因", "\n\n———\n\n".join(parts))
     else:
         print("本次没有需要推送的异动。")
+    for ev in new_events:
+        if not ev["pushed"] and not ev["why"]:
+            ev["why"] = f"超过本轮最多推送 {MAX_ALT_PUSH} 个的限制"
+    state["events"] = [e for e in state["events"] + new_events if now_ms - e["ts"] < 36 * 3600 * 1000]
+    maybe_heartbeat(state, now_ms, len(universe), by_coin)
     state["last_alert"] = {k: v for k, v in state["last_alert"].items() if now_ms - int(v) < 24 * 3600 * 1000}
     save_state(state)
 
