@@ -15,6 +15,7 @@ OKX 永续合约 异动归因：价格大涨大跌时，告诉你"可能是为�
 
 独立文件，不依赖其他脚本。环境变量 DINGTALK_WEBHOOK_MOVE（或 DINGTALK_WEBHOOK）不设置时只打印不推送。
 手动测试推送通道：python move_explainer.py --test
+回看某个时间点脚本会怎么判断（不推送，只打印）：python move_explainer.py --at "2026-11-09 05:50" --coin ETH
 """
 
 import datetime
@@ -80,6 +81,7 @@ CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
 INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments"
 LIQ_URL = "https://www.okx.com/api/v5/public/liquidation-orders"
 FUNDING_URL = "https://www.okx.com/api/v5/public/funding-rate"
+HISTORY_URL = "https://www.okx.com/api/v5/market/history-candles"
 
 # 常见币的名字（小写），用来在新闻标题里认出是哪个币；没列出的币只按大写代码精确匹配（如 "APT"）
 ALIASES = {
@@ -488,8 +490,41 @@ def maybe_heartbeat(state, now_ms, n_coins, by_coin):
     push_to_dingtalk("合约异动归因（每日运行报告）", "\n".join(lines))
 
 
+def explain_at(argv):
+    """回看：用历史K线重算某个时间点（北京时间）BTC 和指定币的数据，告诉你当时的规则会不会判定为异动"""
+    at = argv[argv.index("--at") + 1]
+    coin = argv[argv.index("--coin") + 1].upper() if "--coin" in argv else "ETH"
+    dt = datetime.datetime.strptime(at, "%Y-%m-%d %H:%M")
+    at_ms = int((dt - datetime.timedelta(hours=8)).replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    print(f"回看 {at}（北京时间），币种 {coin}；只用这个时间点之前已经收盘的 5 分钟线\n")
+    for c in dict.fromkeys(["BTC", coin]):
+        rows = get_json(HISTORY_URL, {"instId": f"{c}-USDT-SWAP", "bar": "5m", "after": str(at_ms), "limit": "100"}, (5, 10))
+        ks = [k for k in reversed(rows) if k[8] == "1"][-40:]
+        m = analyze_moves(ks)
+        if not m:
+            print(f"{c}：数据不够，没法分析")
+            continue
+        thr15, thr60 = (MAJOR_MOVE_15M, MAJOR_MOVE_60M) if c in MAJORS else (ALT_MOVE_15M, ALT_MOVE_60M)
+        net_rule = abs(m["move15"]) >= thr15 or abs(m["move60"]) >= thr60
+        if c not in MAJORS:
+            net_rule = net_rule and m["ratio"] >= ALT_VOL_RATIO
+        print(f"【{c}】最后一根已收盘的K线开盘于 {fmt_time(ks[-1][0])}，收盘价 {fmt_px(m['price'])}")
+        print(f"  近15分钟 {m['move15']*100:+.2f}%（阈值 {thr15*100:.0f}%），近1小时 {m['move60']*100:+.2f}%（阈值 {thr60*100:.0f}%），"
+              f"最近15分钟成交额是此前均值的 {m['ratio']:.1f} 倍" + ("" if c in MAJORS else f"（要求 ≥{ALT_VOL_RATIO:.0f} 倍）"))
+        print(f"  最近3根里振幅最大的一根（{fmt_time(m['spike_ts'])}）：{m['spike_rng']*100:.2f}%，"
+              f"{'下砸' if m['spike_dir'] == 'down' else '上拉'}，成交额是此前每根均值的 {m['spike_vol']:.1f} 倍")
+        print(f"  旧规则（只看收盘净涨跌）：{'会' if net_rule else '不会'}判为异动")
+        print(f"  新规则（含单根针）：{'会' if is_mover(c, m) else '不会'}判为异动" + ("（靠单根针触发）" if is_mover(c, m) and not net_rule else ""))
+        print()
+    print("说明：这里只判断'数据是否达到阈值'。真正推送还要看：该币有没有在成交额前 150（24h成交额 ≥ 1000 万美元）、"
+          "同一个币 2 小时内是否推送过（冷却）、大盘异动期间是否已并入大盘消息。")
+
+
 def main():
     now_ms = int(time.time() * 1000)
+    if "--at" in sys.argv:
+        explain_at(sys.argv)
+        return
     if "--test" in sys.argv:
         push_to_dingtalk("合约异动归因（测试消息）",
                          f"时间 {fmt_time(now_ms)}（北京时间）\n这是一条测试消息，用来确认钉钉群的 Webhook 配置正确。\n"
@@ -507,7 +542,11 @@ def main():
 
     def fetch(item):
         try:
-            return item, analyze_moves(get_klines(item["inst"], "5m", 40))
+            ks = get_klines(item["inst"], "5m", 50)       # 多要几根：OKX 返回里最新一根是还没收盘的，过滤掉以后至少要剩 40 根
+            m = analyze_moves(ks)
+            if m is None:
+                print(f"{item['inst']} 已收盘的5分钟线只有 {len(ks)} 根，不够分析", file=sys.stderr)
+            return item, m
         except Exception as e:
             print(f"{item['inst']} 取K线失败: {e}", file=sys.stderr)
             return item, None
@@ -518,8 +557,9 @@ def main():
         results = [(it, m) for it, m in ex.map(fetch, universe) if m]
     moves = {it["coin"]: m for it, m in results}
     by_coin = {it["coin"]: it for it, _ in results}
+    print(f"成功取到 {len(moves)}/{len(universe)} 个币的5分钟线")
     if "BTC" not in moves:
-        print("没有取到 BTC 行情，本轮结束")
+        print("警告：没有取到 BTC 行情，本轮结束。可能原因：BTC 不在监控范围、接口请求失败，或已收盘的K线不足。请看上面的报错行", file=sys.stderr)
         return
     btc, eth = moves["BTC"], moves.get("ETH")
     b_up, b_down = breadth_of(moves)
