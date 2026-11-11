@@ -74,7 +74,7 @@ OI_PRICE_FLAT = 0.03            # 同期价格涨跌 <= 3%（价格没动，持�
 OI_SAMPLE_MIN = 30              # 持仓量快照的记录间隔（分钟）
 
 # 要推送哪几种线索：跑完 whale_replay.py 后，把"没有明显好于随机基准"的特征从这里删掉
-ENABLED_KINDS = {"accumulation", "wick_down", "wick_up", "distribution", "wash", "oi_surge"}
+ENABLED_KINDS = {"accumulation", "wick_up", "distribution", "wash", "oi_surge"}
 COOLDOWN_MIN = 360              # 同一个币同一种线索，6 小时内只推一次
 MAX_PUSH = 6                    # 每轮最多推几个
 FUNDING_CROWDED = 0.0003        # 资金费率绝对值超过 0.03% 视为一边拥挤
