@@ -398,7 +398,7 @@ def htf_trend(inst):
 def btc_move_1h():
     """BTC 近 1 小时涨跌幅，取不到返回 None"""
     try:
-        ks = [k for k in get_klines("BTC-USDT-SWAP", "5m", 20) if k[8] == "1"]
+        ks = [k for k in get_klines("BTC-USDT-SWAP", "5m", 30) if k[8] == "1"]
         c = [float(k[4]) for k in ks]
         return c[-1] / c[-13] - 1
     except Exception as e:
@@ -795,7 +795,7 @@ def main():
 
         def fetch5(item):
             try:
-                ks = [k for k in get_klines(item["inst"], "5m", 40) if k[8] == "1"]
+                ks = [k for k in get_klines(item["inst"], "5m", 50) if k[8] == "1"]     # 多要几根：最新一根没收盘，过滤后要至少剩 40 根
                 return item, ks
             except Exception as e:
                 print(f"{item['inst']} 5m K线获取失败: {e}", file=sys.stderr)
@@ -805,6 +805,10 @@ def main():
 
         with ThreadPoolExecutor(max_workers=3) as ex:
             fetched = list(ex.map(fetch5, cand))
+        ok_n = sum(1 for _, ks in fetched if ks and len(ks) >= 40)
+        print(f"5分钟线：{ok_n}/{len(cand)} 个币取到了足够的已收盘K线")
+        if ok_n == 0:
+            print("警告：没有一个币取到足够的5分钟线，早期异动、急速拉升/下跌、放量榜这一轮都不会触发", file=sys.stderr)
         early_hits = {"up": [], "down": []}
         for item, ks in fetched:
             if not ks:
