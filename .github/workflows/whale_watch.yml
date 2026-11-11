@@ -1,0 +1,32 @@
+name: whale_watch
+on:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "只发一条测试消息，不扫描"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: whale_watch
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python whale_watch.py ${{ inputs.test && '--test' || '' }}
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_WEBHOOK_WHALE: ${{ secrets.DINGTALK_WEBHOOK_WHALE }}
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          git commit -m "update whale state" || true
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 3; done
