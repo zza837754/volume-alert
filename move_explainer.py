@@ -209,7 +209,8 @@ def analyze_moves(ks):
     return {"move15": c[-1] / c[-4] - 1, "move60": c[-1] / c[-13] - 1, "price": c[-1],
             "ratio": sum(q[-3:]) / base if base > 0 else 0.0,
             "spike_rng": (h[j] - l[j]) / o[j], "spike_dir": "down" if c[j] < o[j] else "up",
-            "spike_vol": q[j] / per_bar if per_bar > 0 else 0.0, "spike_ts": ks[j][0]}
+            "spike_vol": q[j] / per_bar if per_bar > 0 else 0.0, "spike_ts": ks[j][0],
+            "low3": min(l[-3:]), "high3": max(h[-3:])}
 
 
 def spike_hit(coin, m):
@@ -231,6 +232,34 @@ def direction_of(m):
     if abs(net) < 0.5 * m["spike_rng"]:        # 净涨跌很小，但有一根很大的针：按那根针的方向算
         return m["spike_dir"]
     return "up" if net > 0 else "down"
+
+
+OP_STOP_BUFFER = 0.002          # 止损放在极值外侧再留 0.2%
+OP_RISK_TOO_WIDE = 0.08         # 止损距离超过 8% 就提示"不建议追"
+
+
+def op_line(m, direction):
+    """操作参考：按最近 3 根 5 分钟线的极值设止损，给出 1.5R / 3R 目标。只是机械的参考，没有经过验证"""
+    px = m["price"]
+    if direction == "up":
+        stop = m["low3"] * (1 - OP_STOP_BUFFER)
+        risk = (px - stop) / px
+        t1, t2 = px + 1.5 * (px - stop), px + 3 * (px - stop)
+        side, brk = "做多", "跌破"
+    else:
+        stop = m["high3"] * (1 + OP_STOP_BUFFER)
+        risk = (stop - px) / px
+        t1, t2 = px - 1.5 * (stop - px), px - 3 * (stop - px)
+        side, brk = "做空", "涨破"
+    if risk <= 0:
+        return None
+    line = (f"操作参考（{side}）：现价 {fmt_px(px)} 入场，止损 {fmt_px(stop)}（{brk}最近3根K线的{'低' if direction == 'up' else '高'}点，距离 {risk*100:.1f}%），"
+            f"目标1 {fmt_px(t1)}（1.5R），目标2 {fmt_px(t2)}（3R）")
+    if risk > OP_RISK_TOO_WIDE:
+        line += "。止损距离偏大，不建议追"
+    else:
+        line += "。急涨急跌后容易回吐，仓位要小，止损要执行"
+    return line
 
 
 def spike_line(m):
@@ -400,7 +429,7 @@ def fmt_market(direction, btc, eth, breadth_up, breadth_down, movers, news, liq_
     up = direction == "up"
     b = breadth_up if up else breadth_down
     lines = [
-        f"🌍 大盘异动  {'📈 急涨' if up else '📉 急跌'}",
+        f"🌍 大盘异动  {'📈 急涨｜做多方向' if up else '📉 急跌｜做空方向'}",
         f"时间 {fmt_time(now_ms)}（北京时间）",
         f"BTC 近15分钟 {btc['move15']*100:+.1f}%，近1小时 {btc['move60']*100:+.1f}%，现价 {fmt_px(btc['price'])}",
     ]
@@ -417,13 +446,16 @@ def fmt_market(direction, btc, eth, breadth_up, breadth_down, movers, news, liq_
         lines.append(f"可能相关的新闻/公告（近{NEWS_MAX_AGE_HOURS}小时，仅供参考，不一定是原因）：")
         lines += fmt_news(news)
     lines.append(guess_market(direction, btc, b, news, liq_total))
+    op = op_line(btc, direction)
+    if op:
+        lines.append("BTC " + op)
     return "\n".join(lines)
 
 
 def fmt_alt(item, m, direction, btc, breadth_same, news, liq, funding, now_ms):
     up = direction == "up"
     lines = [
-        f"{'🚀 个币急涨' if up else '💥 个币急跌'}  {item['inst'].replace('-SWAP', '')}",
+        f"{'🚀 个币急涨' if up else '💥 个币急跌'}  {'📈 做多方向' if up else '📉 做空方向'}  {item['inst'].replace('-SWAP', '')}",
         f"时间 {fmt_time(now_ms)}（北京时间）",
         f"近15分钟 {m['move15']*100:+.1f}%，近1小时 {m['move60']*100:+.1f}%，成交额是此前均值的 {m['ratio']:.1f} 倍",
         f"现价 {fmt_px(m['price'])}，24h {item['chg']*100:+.1f}%，24h成交额 {item['turnover']/1e6:.0f}M USDT"
@@ -449,6 +481,9 @@ def fmt_alt(item, m, direction, btc, breadth_same, news, liq, funding, now_ms):
     else:
         guess = "暂未找到公开原因：可能是资金/庄家行为，或消息还没有被新闻源收录。没有依据时不要追。"
     lines.append("推测：" + guess)
+    op = op_line(m, direction)
+    if op:
+        lines.append(op)
     return "\n".join(lines)
 
 
