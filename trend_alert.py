@@ -45,6 +45,10 @@ TARGETS = [
 ]
 # 趋势强度：MA25 和 MA99 至少拉开多少，才算"有趋势"（两条线缠在一起就是震荡，不做）
 TREND_MIN_GAP = {"30m": 0.0015, "1H": 0.0025, "4H": 0.004}
+# 效率系数（Kaufman ER）：最近 N 根的"净位移 / 来回走过的总路程"，接近 1 是单边走势，接近 0 是来回震荡。
+# 均线是滞后的：一根大阳线之后价格横盘十几个小时，均线排列还会显示"向上"；ER 看的是价格最近到底有没有在推进。
+TREND_ER = {"30m": (20, 0.30), "1H": (20, 0.30), "4H": (12, 0.25)}      # (回看根数, 最低效率系数)
+STOP_ATR_MULT = 1.0                                                      # 止损距离至少 1 倍 ATR（14 根平均波幅），避免止损放在噪音里
 
 # 按入场周期设置：BTC/ETH 波动比山寨小，阈值要小得多
 PB_WIN = 8                                          # 回踩窗口：最近 8 根
@@ -144,17 +148,30 @@ def invert(klines):
 
 
 # ---------- 趋势与入场 ----------
+def efficiency_ratio(closes, n):
+    """净位移 / 总路程，0~1；数据不够返回 None"""
+    if len(closes) < n + 1:
+        return None
+    seg = closes[-(n + 1):]
+    path = sum(abs(seg[k] - seg[k - 1]) for k in range(1, len(seg)))
+    return abs(seg[-1] - seg[0]) / path if path > 0 else 0.0
+
+
 def trend_of(klines, bar):
-    """趋势：+1 向上 / -1 向下 / 0 震荡（含"方向对但 MA25 与 MA99 没拉开"）；数据不够返回 None"""
+    """趋势：+1 向上 / -1 向下 / 0 震荡（均线没拉开、或最近价格在来回震荡）；数据不够返回 None"""
     c = [float(k[4]) for k in klines]
     i = len(c) - 1
     m25, m99, m25_4 = ma(c, 25, i), ma(c, 99, i), ma(c, 25, i - 4)
     if None in (m25, m99, m25_4):
         return None
     gap = TREND_MIN_GAP.get(bar, 0.0)
-    if c[i] > m25 > m99 and m25 > m25_4 and (m25 - m99) / m99 >= gap:
+    n, er_min = TREND_ER.get(bar, (20, 0.0))
+    er = efficiency_ratio(c, n)
+    if er is not None and er < er_min:                 # 最近价格在来回震荡，均线排列只是旧行情的残留
+        return 0
+    if c[i] > m25 > m99 and m25 > m25_4 and (m25 - m99) / m99 >= gap and c[i] > c[-1 - n]:
         return 1
-    if c[i] < m25 < m99 and m25 < m25_4 and (m99 - m25) / m99 >= gap:
+    if c[i] < m25 < m99 and m25 < m25_4 and (m99 - m25) / m99 >= gap and c[i] < c[-1 - n]:
         return -1
     return 0
 
@@ -198,7 +215,8 @@ def analyze(klines, bar):
 
     # ✅ 确认：阳线，收盘高过上一根最高价，并且站上 MA7
     if c[i] > o[i] and c[i] > h[i - 1] and c[i] > m7_i:
-        stop = pb_low * (1 - STOP_BUFFER)
+        atr_pct = sum((h[j] - l[j]) / c[j] for j in range(i - 13, i + 1)) / 14      # 14 根平均波幅（占价格的比例）
+        stop = min(pb_low * (1 - STOP_BUFFER), c[i] * (1 - STOP_ATR_MULT * atr_pct))   # 取更远的那个，止损不放在噪音里
         risk = (c[i] - stop) / c[i]
         t1, t2 = sh, sh + (sh - pb_low)              # 目标1：前高；目标2：等幅延伸（前高 + 这一波回踩的幅度）
         if RISK_MIN[bar] <= risk <= RISK_MAX[bar] and c[i] < t1:
@@ -357,7 +375,7 @@ def main():
 
     def klines(inst, bar, limit=150):
         if (inst, bar) not in cache:
-            cache[(inst, bar)] = get_klines(inst, bar, limit)
+            cache[(inst, bar)] = get_klines(inst, bar, max(limit, 160))   # 统一多取一些：同一周期会被不同用途复用，OKX 返回里还带一根未收盘的
             time.sleep(0.25)
         return cache[(inst, bar)]
 
