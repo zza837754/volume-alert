@@ -840,10 +840,16 @@ PATTERNS = {
 # 默认只开 5 种：条件最严、出现最少、带止损/目标位的。
 # 关掉的 3 种：weak_restart、bounce_short / bounce_long（后两种出现太频繁，没验证过）。restart（强势回调再启动，用 15 分钟线看）已按 ARIA 那张图放宽后重新打开。
 # 想打开，把名字加回这个集合即可。
-ENABLED_PATTERNS = {"fake", "breakout", "breakdown", "trend_long", "trend_short", "retest_short", "retest_long"}   # restart 已搬到 rank_monitor.py（只在涨跌幅榜里找）；想在全部币里找，把 "restart" 加回来
+# 形态扫描已全部关闭（用户决定）：retest 类用真实数据回放没有优势；其余形态没有用真实数据验证过。
+# 想重新打开某个形态，把它的名字加回这个集合，例如 {"breakout", "breakdown"}；可选名字见上面的 PATTERNS。
+# 集合为空时，脚本一开始就退出，不扫描、不联网、不推送。
+ENABLED_PATTERNS = set()
 
 
 def main():
+    if not ENABLED_PATTERNS:
+        print("所有形态都已关闭（ENABLED_PATTERNS 为空），本轮不扫描。")
+        return
     if AVOID_FUNDING_WINDOW and in_funding_window():
         print("当前处在资金费结算前后的避开时段，本轮不扫描。")
         return
