@@ -1,1 +1,1 @@
-{"last_alert": {}, "signals": [], "last_report_date": "2026-11-28"}
+{"last_alert": {"ETH-USDT-SWAP|15m|short|confirm": "1795870846824"}, "signals": [{"inst": "ETH-USDT-SWAP", "bar": "15m", "side": "short", "ts": "1795869900000", "at": 1795870846824, "entry": 1646.23, "stop": 1655.3853853853852, "t1": 1638.18, "t2": 1622.919708736701, "rr1": 0.888498599224845, "rr2": 2.5970071916381325, "res": null}], "last_report_date": "2026-11-28"}
